@@ -2,35 +2,77 @@
 
 *[Русская версия](README.md) · English*
 
-**TL;DR** — A Midnight-Commander-style TUI that lets you run several `claude` sessions in one terminal window with tabs, sidebars, a bottom shell pane, and an indicator showing which session is waiting for you.
+**TL;DR** — A Midnight-Commander-style TUI that runs several `claude` sessions in one terminal window. Two-row top chrome: row 0 lists projects (unique cwds), row 1 lists chats inside the active project. Cross-session search, scrollback search of the active chat, file browser, bottom shell pane, OS notifications when a session is waiting on you.
 
 ---
 
 ## Overview
 
-A Midnight-Commander-style TUI host for the [Claude Code](https://claude.com/claude-code) CLI.
-Run several `claude` sessions side-by-side in one terminal window — with tabs, sessions sidebar,
-cross-session search, file browser, a bottom shell pane, and an activity indicator that tells you
-which session is waiting for your permission.
+A TUI host for the [Claude Code](https://claude.com/claude-code) CLI. Run many projects and dozens of chats in parallel — each tab is its own `claude` inside a real PTY, rendered the same as a regular terminal. Open chats are grouped by their cwd ("project"); you switch projects and switch chats inside a project independently.
 
 ## What it gives you over plain `claude`
 
-- **Tabs** — open multiple `claude` processes in one window, switch with `F11/F12` or click.
-- **Sessions sidebar** (`F3`) — list every session from `~/.claude/projects/`, live-filter by title/cwd/branch, `Enter` to resume in a new tab.
-- **Deep grep** (`F5`) — when filtering sessions, grep through the actual `.jsonl` content in the background and see snippet previews of where the match was.
-- **Files sidebar** (`Ctrl+B`) — VSCode-style file tree, chrooted to the active tab's cwd; `Space` inserts the relative path into the chat input.
-- **File explorer modal** (`F6`) — navigate the whole filesystem; `Space` inserts an absolute path into the chat input.
-- **Command palette** (`F9`) — fuzzy-pick any action *or* any session.
-- **Bottom shell pane** (`Ctrl+\``) — embedded PTY running your parent shell (PowerShell / pwsh / bash / cmd, auto-detected). Run `git status`, `cargo build` etc. without switching windows.
-- **Activity overlay** — each tab shows `●` (streaming) or `!` (awaiting permission) so you can run several Claude sessions in parallel and see who needs you.
-- **Persistent layout** — when you quit, tabs and their session IDs are saved to `~/.cmux/layout.json`; on next launch, `F9 → Restore previous layout` brings them all back with `--resume`.
-- **Click-friendly chrome** — every F-key has a button in the bottom bar; tabs, `+`, borders are all clickable; drag borders to resize.
+### Projects and chats grouping
+
+- **Two-row top chrome**: row 0 — projects (unique cwds among open tabs), row 1 — chats in the active project.
+- `F2` opens a new chat **in the current project** (active tab's cwd, not the cwd cmux was launched from).
+- `F6 → OpenHere` spawns a chat in the selected directory. If that cwd already matches a project, the chat joins it; otherwise a new project appears in row 0 with its first chat.
+- Closing the last chat of a project removes the project from row 0.
+
+### Sessions
+
+- **F3 sidebar** — sessions from `~/.claude/projects/`, scoped to the active tab's cwd hierarchy. Live text filter, deep grep across `.jsonl` content via `F5`. `Ctrl+R` re-reads from disk.
+- **Shift+F3 global modal** — every session, grouped by directory with section headers. Same text filter; `↑/↓` skip headers. `Ctrl+R` refresh.
+
+### Search
+
+- **Command palette F9** — fuzzy-pick any action or session. Also where you save/switch/delete named layouts and pin/unpin the active tab.
+- **Chat-history search Ctrl+F** — overlay at the bottom of the PTY. Matches are highlighted yellow in-place plus a snippet below the input with an `N/M` counter. `↑/↓` (or Enter for "next") step through hits; the vt100 scrollback follows so the selected line stays visible.
+
+### Files
+
+- **Files sidebar Ctrl+B** — VSCode-style tree, chrooted to the active tab's cwd; `Space` inserts the relative path into the chat input.
+- **F6 modal explorer** — navigate the whole filesystem. On Windows `←` at a drive root (`C:\`) jumps to a virtual drives list. `Space` inserts an absolute path; `Enter` on the "OpenHere" entry spawns a new chat in that cwd.
+
+### Chats and tabs
+
+- **Rename Shift+F2** — modal pre-filled with the title. Empty input resets to cwd basename.
+- **Pin/Unpin** — pinned chats refuse F8/Alt+W close, marked with 📌. Toggle via palette.
+- **Drag-to-reorder** — mouse: down on chat A, release on chat B → swap (within the same project).
+- **`[N]` badge** — on inactive chats, the count of completed replies (streaming → idle transitions) you've missed. Cleared on focus.
+
+### Claude slash commands
+
+- **F4** — sidebar listing slash commands. Loads project-local (`<cwd>/.claude/commands/*.md`) and user-global (`~/.claude/commands/*.md`). Each entry shows a `[project]` / `[user]` badge plus the built-ins. Description comes from a YAML `description:` frontmatter field or the first non-heading line of the .md.
+
+### Environment
+
+- **Bottom shell pane `` Ctrl+` ``** — embedded PTY running the parent shell (PowerShell / pwsh / bash / zsh / fish / cmd, auto-detected via sysinfo). Auto-`cd`s to the active tab's cwd on switch (toggleable).
+- **Bracketed paste** — multi-line clipboard pastes reach claude as one atomic chunk, no premature Enter / submit on every `\n`.
+
+### Signalling
+
+- **Activity overlay**: `●` (streaming) or `!` (awaiting permission) after the chat title.
+- **OS notifications** on the transition into AwaitingPermission: terminal BEL plus a Windows toast (via `powershell -EncodedCommand` + WinRT — no extra deps). On macOS/Linux the toast is a no-op, BEL still works.
+- AwaitingPermission patterns are editable in config — add your own if claude uses different wording in your locale.
+
+### Layout
+
+- **Auto-save** — current state is written to `~/.cmux/layout.json` on every change (chat open/close, pin toggle).
+- **Auto-restore on startup** — opt-in (`[layout] auto_restore = true`).
+- **Named layouts** — `~/.cmux/layouts/<name>.json`. Via the palette: `★ Save current layout as…`, `⇄ Switch to layout: …`, `✕ Delete saved layout: …`.
+
+### Click-friendly
+
+- Every F-key has a button in the bottom bar; chats, projects, `+`, borders are clickable; borders drag-to-resize.
 
 ## Requirements
 
-- Windows 10+ (other OSes may work but only Windows is tested)
-- [Claude Code](https://claude.com/claude-code) installed and on `PATH` as `claude.cmd`
-- Rust toolchain (>= 1.75) to build from source
+- Rust toolchain (>= 1.75) to build from source.
+- [Claude Code](https://claude.com/claude-code) on `PATH`:
+  - Windows — `claude.cmd`.
+  - Linux/macOS — `claude`.
+- Windows 10+ — primary platform (tested). Linux/macOS support is in the codebase but not actively tested.
 
 ## Install
 
@@ -38,93 +80,167 @@ which session is waiting for your permission.
 git clone https://github.com/evengenius/cmux
 cd cmux
 cargo build --release
-# Resulting binary: target/release/cmux.exe
+# Resulting binary: target/release/cmux.exe (Windows) or target/release/cmux (Unix)
 ```
 
-Move/symlink `target/release/cmux.exe` somewhere on your `PATH`, then run `cmux`.
+Move/symlink the binary somewhere on your `PATH`, then run `cmux`.
 
-## Keyboard quick-reference
+## Keymap
+
+### Global
 
 | Key | Action |
 | --- | --- |
 | `F1` | Help overlay (full keymap) |
-| `F2` | New tab |
-| `F3` | Sessions sidebar |
-| `F4` | Claude commands sidebar |
-| `F5` | Toggle deep-grep (in Sessions) |
-| `F6` | File explorer (modal, whole filesystem) |
-| `F7` | Toggle mouse mode (off = native terminal text select) |
-| `F8` | Close active tab (last tab kept) |
+| `F2` | New chat in the active project |
+| `F3` | Sessions sidebar (scoped to active tab's cwd) |
+| `Shift+F3` | Global sessions modal (grouped by directory) |
+| `F4` | Slash-commands sidebar (built-in + user + project) |
+| `F5` | Toggle deep-grep (while F3 sidebar is focused) |
+| `F6` | File explorer modal (whole filesystem) |
+| `F7` | Toggle mouse mode (off = native terminal selection) |
+| `F8` | Close active chat (pinned chats refuse) |
 | `F9` | Command palette |
 | `F10` / `Ctrl+Q` | Quit |
-| `F11` / `F12` | Previous / next tab |
-| `Ctrl+B` | Files sidebar (chrooted to tab cwd) |
-| `` Ctrl+` `` | Bottom shell pane |
-| `Esc` (in sidebar / bottom) | Unfocus — panel stays visible, keys go back to claude |
-| `Alt+1..9` | Switch to tab N |
-| `Alt+T` / `Alt+W` | New / close tab |
+| `Shift+F2` | Rename active chat |
+
+### Chat navigation (within the active project)
+
+| Key | Action |
+| --- | --- |
+| `F11` / `F12` | Previous / next chat |
+| `Alt+←` / `Alt+→` | Same |
+| `Alt+1..9` | Chat N within the active project |
+| `Ctrl+PgUp` / `Ctrl+PgDn` | Previous / next chat |
+| `Alt+T` / `Alt+W` | New / close chat |
+
+### Project navigation
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+F11` / `Ctrl+F12` | Previous / next project |
+| `Ctrl+Shift+1..9` | Jump to project N |
+
+### Search
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+F` | Search active chat's scrollback |
+| `↑` / `↓` or `Enter` | Step through matches |
+| `Esc` | Close, scrollback → 0 |
+
+### Environment
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+B` | Files sidebar (chroot to tab cwd) |
+| `` Ctrl+` `` | Bottom shell pane (parent shell) |
+| `PgUp` / `PgDn` | PTY scrollback (when claude is focused) |
+| `Esc` (in sidebar/bottom) | Unfocus — panel stays visible, keys go back to claude |
+| `Drag border` | Resize sidebar / bottom pane |
+| `Shift + drag` | Native terminal text selection (for copy) |
+
+### Sidebars
+
+| Key | Action |
+| --- | --- |
+| `F3` `Ctrl+R` | Re-read session list from disk |
 | `Sidebar Enter` | Files: cd / open here · Sessions: resume · Commands: submit |
 | `Sidebar Space` | Files: insert *relative* path · Commands: insert (no submit) |
 | `F6 Space` | Insert *absolute* path |
-| `Drag border` | Resize sidebar / bottom pane |
-| `Shift + drag` | Native terminal text select (for copy) |
+
+### Mouse
+
+- Click a project in row 0 → switch to that project's first chat.
+- Click a chat in row 1 → switch active chat.
+- Drag a chat (down → up on a different chat) → swap (within the same project).
 
 ## Configuration
 
-Configuration lives at `~/.cmux/config.toml` (created with defaults on first launch).
+Config lives at `~/.cmux/config.toml`, created with defaults on first launch. After editing, press `F9 → ★ Reload config` to apply without restart (some fields only apply to newly-spawned panes/tabs).
 
 ```toml
 [layout]
 sidebar_width = 42         # left sidebar (Sessions/Commands)
 right_sidebar_width = 42   # right sidebar (Files)
 bottom_height = 12         # bottom shell pane
+auto_restore = false       # auto-restore ~/.cmux/layout.json on startup
 
 [browser]
-show_hidden = false        # show .git, .claude etc. in file browser
+show_hidden = false        # show .git, .claude, etc.
 
 [shell]
-# Override the bottom-pane shell. Empty = autodetect from parent process.
-exe = ""
-args = []
+exe = ""                   # override the bottom-pane shell
+args = []                  #   empty = autodetect from parent process
+follow_tab_cwd = true      # cd the bottom shell when switching tabs
 # Example:
 # exe = "pwsh.exe"
 # args = ["-NoLogo"]
+
+[detect]
+# Lowercase substrings that flag a tab as "awaiting your input".
+# Add patterns here if claude uses different wording in your locale.
+permission_patterns = [
+  "do you want to",
+  "allow this tool",
+  "approve this",
+  "(y/n)",
+]
+
+[notify]
+bell = true    # terminal BEL on AwaitingPermission transition
+toast = true   # Windows toast (no-op on other OSes)
 ```
 
-After editing the config, press `F9 → ★ Reload config` to apply without restart.
-Some settings (scrollback size, the bottom shell) only take effect for newly-spawned panes.
+## Layout persistence
 
-## Persistent layout
+- **Auto-save** to `~/.cmux/layout.json` on every state change.
+- **Auto-restore** on startup: only when `[layout] auto_restore = true`. Otherwise pick `F9 → ★ Restore previous layout` manually.
+- **Named layouts** in `~/.cmux/layouts/<name>.json`:
+  - `★ Save current layout as…` (palette) — prompts for a name, sanitises (strips `/ \ : * ? " < > |`, control bytes, collapses whitespace to `_`).
+  - `⇄ Switch to layout: <name>` per layout.
+  - `✕ Delete saved layout: <name>` per layout.
 
-Each time you open/close a tab, the current state is written to `~/.cmux/layout.json` (tab cwds + resolved session IDs).
-On startup the file is loaded but **not** restored automatically — open the command palette (`F9`) and pick
-**★ Restore previous layout** to bring it back.
+Per-tab persisted fields: `cwd`, `session_id` (for resume), `title`, `created_at_unix`, `pinned`.
 
-## Activity indicators
+## Indicators
 
-In the tab bar, after the tab title:
+In the chat bar:
 
-- **`●` (yellow)** — recent output, the embedded `claude` is streaming.
-- **`!` (red, blinking)** — text on screen matches a permission prompt (`do you want to`, `approve`, `allow this tool`, `(y/n)`) — Claude is waiting for you.
-- **nothing** — idle.
+- **`●` (yellow)** — claude is streaming.
+- **`!` (red, blinking)** — screen text matches one of `permission_patterns` — claude is waiting on you.
+- **`[N]`** — N completed replies (streaming → idle transitions) you haven't seen. Cleared on focus.
+- **`📌`** — chat is pinned.
 
-Run five tabs in parallel, and switch to whichever one lights up red.
+In the project bar: active project highlighted in cyan.
 
-## How it works (load-bearing pieces)
+## Chat-history search
 
-- Each tab spawns `cmd.exe /c claude.cmd` (with optional `--resume <id>`) inside a real PTY (`portable-pty`), so Claude's TUI renders exactly as it would in a regular terminal.
-- The PTY output flows through a `vt100` parser into a `tui-term` widget rendered by `ratatui`.
-- A scrollback buffer (10k lines) is owned by us, so wheel/PgUp/PgDn scroll back through history without going to the underlying app.
-- Deep-grep runs in a background thread that streams hits over an `mpsc` channel; cancellation is automatic when the query changes.
-- Parent shell for the bottom pane is detected via `sysinfo` (PID of our parent process → image name → known shell).
+`Ctrl+F` opens an overlay at the bottom of the PTY. Each keystroke recomputes matches (case-insensitive). Hits are highlighted yellow in-place plus a context snippet under the input showing the current match with an `N/M` counter. `↑/↓` (or Enter for "next") step through; the vt100 scrollback follows so the selected match stays visible.
 
-## Limitations / known sharp edges
+Search runs over a plain-text mirror of the PTY (ANSI is stripped, `\r` resets the line, `\n` commits it). Buffer cap is 10k lines, matching vt100's scrollback.
 
-- Windows-only tested. Other OSes are best-effort.
-- The bottom shell starts in the cwd that `cmux` was launched from — not the active tab's cwd.
-- `session_id` for *new* (non-resumed) tabs is heuristically resolved at save-time by matching tab cwd to the freshest `.jsonl` in `~/.claude/projects/`. With two tabs in the same cwd it might attribute wrongly.
-- Custom keybindings are not yet config-driven — F-keys are hardcoded.
-- If a `.jsonl` line contains a `lowercase()`-resizing character (Turkish İ, German ß), grep snippet may show the lowercased form rather than the original case.
+Known limitation: matches that span a line wrap aren't found — each visible row is scanned independently.
+
+## How it works
+
+- Each tab spawns a real PTY via `portable-pty`:
+  - Windows: `cmd.exe /c claude.cmd [--resume <id>]`.
+  - Unix: `claude [--resume <id>]`.
+- Output flows into a `vt100` parser (rendered via `tui-term` + `ratatui`) and in parallel into a separate text-only mirror used by Ctrl+F.
+- The 10k-line scrollback is owned by us, so wheel/PgUp/PgDn scroll history without leaking into the inner app.
+- Deep-grep runs in a background thread over an `mpsc` channel; auto-cancels when the query changes.
+- Bottom-pane shell is identified via `sysinfo` (parent PID → image name → known shell).
+- AwaitingPermission detection scans `parser.screen().contents()` (lowercased) for substring matches from `[detect] permission_patterns`.
+- Windows toast: a background `powershell.exe -EncodedCommand <UTF-16LE base64>` call into WinRT's `ToastNotificationManager`. No extra crates.
+
+## Limitations
+
+- Primary platform is Windows. Linux/macOS code compiles and should run, but isn't actively tested here.
+- With `follow_tab_cwd = true` the bottom shell receives a `cd` line on tab switch — if you're typing into the shell at that moment, your input gets clobbered. To prevent that, follow only fires when the bottom pane isn't focused.
+- `session_id` for *new* (non-resumed) tabs is resolved heuristically at save time by matching tab cwd against the freshest `.jsonl` in `~/.claude/projects/`. Two concurrent tabs in the same cwd may attribute incorrectly.
+- Keybindings aren't config-driven yet (F-keys are hardcoded).
+- In-PTY match highlighting doesn't cross line wraps.
 
 ## License
 
