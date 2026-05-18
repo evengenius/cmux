@@ -1586,7 +1586,9 @@ fn handle_files_sidebar_key(
                     Some(br.cwd.join(n))
                 }
                 Some(BrowserEntry::OpenHere) => Some(br.cwd.clone()),
-                Some(BrowserEntry::Parent) | None => None,
+                Some(BrowserEntry::Parent)
+                | Some(BrowserEntry::Drive(_))
+                | None => None,
             };
             if let Some(p) = path {
                 let root = app.tabs[app.active].cwd.clone();
@@ -1599,7 +1601,9 @@ fn handle_files_sidebar_key(
                 Some(BrowserEntry::OpenHere) => Some(BrowserAction::OpenHere),
                 Some(BrowserEntry::Parent) => Some(BrowserAction::CdParent),
                 Some(BrowserEntry::Dir(n)) => Some(BrowserAction::CdInto(n.clone())),
-                Some(BrowserEntry::File(_)) | None => None,
+                Some(BrowserEntry::File(_))
+                | Some(BrowserEntry::Drive(_))
+                | None => None,
             };
             match action {
                 Some(BrowserAction::OpenHere) => {
@@ -1611,7 +1615,8 @@ fn handle_files_sidebar_key(
                 }
                 Some(BrowserAction::CdParent) => br.cd_parent(),
                 Some(BrowserAction::CdInto(n)) => br.cd_into(&n),
-                None => {}
+                // Drives-root is unreachable when chrooted; keep the match exhaustive.
+                Some(BrowserAction::CdDrive(_)) | None => {}
             }
         }
         _ => {}
@@ -1667,11 +1672,15 @@ fn handle_browser_key(
         KeyCode::End => br.end(),
         KeyCode::Left | KeyCode::Backspace => br.cd_parent(),
         KeyCode::Right => {
-            if let Some(name) = match br.selected() {
-                Some(BrowserEntry::Dir(n)) => Some(n.clone()),
+            let action = match br.selected() {
+                Some(BrowserEntry::Dir(n)) => Some(BrowserAction::CdInto(n.clone())),
+                Some(BrowserEntry::Drive(l)) => Some(BrowserAction::CdDrive(l.clone())),
                 _ => None,
-            } {
-                br.cd_into(&name);
+            };
+            match action {
+                Some(BrowserAction::CdInto(n)) => br.cd_into(&n),
+                Some(BrowserAction::CdDrive(l)) => br.cd_drive(&l),
+                _ => {}
             }
         }
         KeyCode::Char(' ') => {
@@ -1682,6 +1691,7 @@ fn handle_browser_key(
                     Some(br.cwd.join(n))
                 }
                 Some(BrowserEntry::OpenHere) => Some(br.cwd.clone()),
+                Some(BrowserEntry::Drive(l)) => Some(std::path::PathBuf::from(format!("{}:\\", l))),
                 Some(BrowserEntry::Parent) | None => None,
             };
             if let Some(p) = path {
@@ -1695,6 +1705,7 @@ fn handle_browser_key(
                 Some(BrowserEntry::OpenHere) => Some(BrowserAction::OpenHere),
                 Some(BrowserEntry::Parent) => Some(BrowserAction::CdParent),
                 Some(BrowserEntry::Dir(n)) => Some(BrowserAction::CdInto(n.clone())),
+                Some(BrowserEntry::Drive(l)) => Some(BrowserAction::CdDrive(l.clone())),
                 Some(BrowserEntry::File(_)) | None => None,
             };
             match action {
@@ -1707,6 +1718,7 @@ fn handle_browser_key(
                 }
                 Some(BrowserAction::CdParent) => br.cd_parent(),
                 Some(BrowserAction::CdInto(n)) => br.cd_into(&n),
+                Some(BrowserAction::CdDrive(l)) => br.cd_drive(&l),
                 None => {}
             }
         }
@@ -1719,6 +1731,7 @@ enum BrowserAction {
     OpenHere,
     CdParent,
     CdInto(String),
+    CdDrive(String),
 }
 
 // ===========================================================================
@@ -1756,7 +1769,7 @@ fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         ])
         .split(inner);
 
-    let hint = " Enter open · Space → claude (absolute) · → cd · ← parent · F6 close ";
+    let hint = " Enter open · Space → claude (absolute) · → cd · ← parent (← at drive root → drives) · F6 close ";
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
@@ -1796,6 +1809,9 @@ fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
             BrowserEntry::Parent => Style::default().fg(Color::Yellow),
             BrowserEntry::Dir(_) => Style::default().fg(Color::Cyan),
             BrowserEntry::File(_) => Style::default().fg(Color::White),
+            BrowserEntry::Drive(_) => {
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+            }
         };
         let style = if selected {
             base.bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD)
@@ -2311,6 +2327,9 @@ fn render_files_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             BrowserEntry::Parent => Style::default().fg(Color::Yellow),
             BrowserEntry::Dir(_) => Style::default().fg(Color::Cyan),
             BrowserEntry::File(_) => Style::default().fg(Color::White),
+            BrowserEntry::Drive(_) => Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         };
         let style = if selected {
             base.bg(Color::White)

@@ -5,6 +5,8 @@ pub enum Entry {
     Parent,
     Dir(String),
     File(String),
+    /// Windows-only: a drive root like `C:\` shown at the virtual "drives" root.
+    Drive(String),
 }
 
 impl Entry {
@@ -14,6 +16,7 @@ impl Entry {
             Entry::Parent => "..  (up)".to_string(),
             Entry::Dir(n) => format!("📁  {}", n),
             Entry::File(n) => format!("📄  {}", n),
+            Entry::Drive(letter) => format!("💽  {}:\\", letter),
         }
     }
 }
@@ -23,6 +26,9 @@ pub struct FileBrowser {
     pub show_hidden: bool,
     /// If set, navigation is jailed to this directory (no `..` above it).
     pub root: Option<PathBuf>,
+    /// True when sitting above all drives (Windows-only virtual root). `cwd`
+    /// is empty in this state and `entries` lists the available drives.
+    pub at_drives_root: bool,
     pub entries: Vec<Entry>,
     pub idx: usize,
     pub scroll: usize,
@@ -35,6 +41,7 @@ impl FileBrowser {
             cwd,
             show_hidden,
             root: None,
+            at_drives_root: false,
             entries: Vec::new(),
             idx: 0,
             scroll: 0,
@@ -53,6 +60,7 @@ impl FileBrowser {
             cwd: canon_cwd,
             show_hidden,
             root: Some(canon_root),
+            at_drives_root: false,
             entries: Vec::new(),
             idx: 0,
             scroll: 0,
@@ -76,8 +84,27 @@ impl FileBrowser {
     pub fn refresh(&mut self) {
         self.entries.clear();
         self.error = None;
+
+        if self.at_drives_root {
+            for letter in enum_drives() {
+                self.entries.push(Entry::Drive(letter));
+            }
+            if self.idx >= self.entries.len() {
+                self.idx = self.entries.len().saturating_sub(1);
+            }
+            self.scroll = 0;
+            return;
+        }
+
         self.entries.push(Entry::OpenHere);
-        if self.cwd.parent().is_some() && !self.at_root() {
+        // `..` exits to drives-root from a drive root (e.g. `C:\`) on Windows
+        // when not chrooted; otherwise climbs one directory.
+        let show_parent = if self.root.is_some() {
+            !self.at_root()
+        } else {
+            cfg!(windows) || self.cwd.parent().is_some()
+        };
+        if show_parent {
             self.entries.push(Entry::Parent);
         }
         match std::fs::read_dir(&self.cwd) {
@@ -119,6 +146,7 @@ impl FileBrowser {
     }
 
     pub fn move_to(&mut self, dest: PathBuf) {
+        self.at_drives_root = false;
         self.cwd = match dest.canonicalize() {
             Ok(p) => strip_unc(p),
             Err(_) => dest,
@@ -127,12 +155,33 @@ impl FileBrowser {
         self.refresh();
     }
 
+    /// Switch into the Windows virtual "list of drives" view.
+    pub fn enter_drives_root(&mut self) {
+        if self.root.is_some() {
+            return; // chrooted: drives-root is not reachable
+        }
+        self.at_drives_root = true;
+        self.cwd = PathBuf::new();
+        self.idx = 0;
+        self.refresh();
+    }
+
     pub fn cd_parent(&mut self) {
+        if self.at_drives_root {
+            return;
+        }
         if self.at_root() {
             return;
         }
-        if let Some(p) = self.cwd.parent().map(|p| p.to_path_buf()) {
-            self.move_to(p);
+        match self.cwd.parent() {
+            Some(p) => self.move_to(p.to_path_buf()),
+            None => {
+                // No parent — at a drive root like `C:\`. On Windows show the
+                // drives list; elsewhere stay put.
+                if cfg!(windows) && self.root.is_none() {
+                    self.enter_drives_root();
+                }
+            }
         }
     }
 
@@ -146,6 +195,15 @@ impl FileBrowser {
             }
         }
         self.move_to(p);
+    }
+
+    /// Pick a drive from the drives-root view (or any time on Windows).
+    pub fn cd_drive(&mut self, letter: &str) {
+        if self.root.is_some() {
+            return;
+        }
+        let root = format!("{}:\\", letter);
+        self.move_to(PathBuf::from(root));
     }
 
     pub fn selected(&self) -> Option<&Entry> {
@@ -185,5 +243,30 @@ fn strip_unc(p: PathBuf) -> PathBuf {
 }
 
 pub fn path_label(p: &Path) -> String {
-    p.to_string_lossy().to_string()
+    let s = p.to_string_lossy();
+    if s.is_empty() {
+        "(drives)".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Enumerate available Windows drive letters by probing `X:\`. Returns an
+/// empty list on non-Windows platforms.
+#[cfg(windows)]
+pub fn enum_drives() -> Vec<String> {
+    let mut out = Vec::new();
+    for c in b'A'..=b'Z' {
+        let letter = c as char;
+        let root = format!("{}:\\", letter);
+        if Path::new(&root).exists() {
+            out.push(letter.to_string());
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn enum_drives() -> Vec<String> {
+    Vec::new()
 }
