@@ -91,6 +91,8 @@ enum Action {
     /// picks a directory and Enter on "OpenHere" spawns a chat there.
     OpenBrowserForNewProject,
     ToggleActiveProjectPin,
+    /// Spawn a new tab in the active project's cwd with `claude --continue`.
+    NewTabContinue,
     ReloadConfig,
     Quit,
 }
@@ -1584,6 +1586,11 @@ impl App {
             });
         };
         push_action(&mut items, "★  New tab", Action::NewTab);
+        push_action(
+            &mut items,
+            "★  New tab continuing last session (claude --continue)",
+            Action::NewTabContinue,
+        );
         push_action(&mut items, "★  Close active tab", Action::CloseTab);
         push_action(&mut items, "★  Previous chat (in project)", Action::PrevTab);
         push_action(&mut items, "★  Next chat (in project)", Action::NextTab);
@@ -1790,6 +1797,36 @@ impl App {
         Ok(())
     }
 
+    /// Spawn a fresh tab in the active project's cwd with `claude --continue`.
+    /// Claude Code resolves --continue to "resume the latest session in this
+    /// directory", so this is the common "new chat continuing where I left
+    /// off" workflow.
+    fn open_tab_continue(&mut self, rows: u16, cols: u16) -> Result<()> {
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        let scrollback = self.config.layout.scrollback_lines;
+        let title = cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("claude")
+            .to_string();
+        let tab = ChatTab::spawn_inner(
+            cwd,
+            &["--continue"],
+            title,
+            None,
+            rows,
+            cols,
+            scrollback,
+        )?;
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        Ok(())
+    }
+
     fn save_layout(&self) {
         let snapshot = self.build_saved_layout();
         let _ = layout::save(&snapshot);
@@ -1915,6 +1952,67 @@ impl App {
         self.apply_layout(saved, rows, cols)
     }
 
+    /// CLI `--resume <id>`: drop the default tab and replace it with a
+    /// resumed one. Spawn cwd stays the user-provided / launch cwd; claude
+    /// uses the session jsonl for the real state anyway.
+    fn cli_replace_default_with_resume(
+        &mut self,
+        id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<()> {
+        let cwd = self
+            .tabs
+            .first()
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        let scrollback = self.config.layout.scrollback_lines;
+        let title = truncate(id, 16);
+        let tab = ChatTab::spawn_resume(cwd, id, title, rows, cols, scrollback)?;
+        for mut old in self.tabs.drain(..) {
+            old.kill();
+        }
+        self.tabs.push(tab);
+        self.active = 0;
+        Ok(())
+    }
+
+    /// CLI `--continue`: replace the default tab with `claude --continue`,
+    /// which Claude Code resolves to "resume the most recent session in this
+    /// cwd". Easier than looking up the session id.
+    fn cli_replace_default_with_continue(
+        &mut self,
+        rows: u16,
+        cols: u16,
+    ) -> Result<()> {
+        let cwd = self
+            .tabs
+            .first()
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        let scrollback = self.config.layout.scrollback_lines;
+        let title = cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("claude")
+            .to_string();
+        let tab = ChatTab::spawn_inner(
+            cwd,
+            &["--continue"],
+            title,
+            None,
+            rows,
+            cols,
+            scrollback,
+        )?;
+        for mut old in self.tabs.drain(..) {
+            old.kill();
+        }
+        self.tabs.push(tab);
+        self.active = 0;
+        Ok(())
+    }
+
     fn toggle_bottom(&mut self) -> Result<()> {
         if self.bottom_open {
             self.bottom_open = false;
@@ -1965,9 +2063,119 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 // ===========================================================================
+// CLI args
+// ===========================================================================
+
+/// Parsed command-line arguments. Lives separately from the TUI state so the
+/// pre-flight phase can read them before raw mode is enabled.
+#[derive(Default)]
+struct CliArgs {
+    /// Positional: starting cwd for the default first tab. Defaults to
+    /// `std::env::current_dir()`.
+    cwd: Option<PathBuf>,
+    /// `--layout NAME` — apply that named layout on startup.
+    layout: Option<String>,
+    /// `--resume ID` — first tab resumes that session id.
+    resume: Option<String>,
+    /// `--continue` — first tab spawns claude with `--continue`.
+    continue_last: bool,
+}
+
+fn parse_args() -> std::result::Result<CliArgs, String> {
+    let mut out = CliArgs::default();
+    let mut iter = std::env::args().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("cmux {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--layout" => {
+                out.layout = Some(iter.next().ok_or("--layout requires a name")?.to_string());
+            }
+            "--resume" => {
+                out.resume = Some(iter.next().ok_or("--resume requires a session id")?.to_string());
+            }
+            "--continue" => {
+                out.continue_last = true;
+            }
+            s if s.starts_with("--") => return Err(format!("unknown flag: {}", s)),
+            s => {
+                if out.cwd.is_some() {
+                    return Err(format!("unexpected positional argument: {}", s));
+                }
+                out.cwd = Some(PathBuf::from(s));
+            }
+        }
+    }
+    if out.resume.is_some() && out.continue_last {
+        return Err("--resume and --continue are mutually exclusive".to_string());
+    }
+    Ok(out)
+}
+
+fn print_usage() {
+    println!(
+        "cmux {ver} — TUI host for the claude CLI
+
+USAGE:
+    cmux [PATH] [OPTIONS]
+
+ARGS:
+    PATH                Starting cwd for the first tab (default: current dir)
+
+OPTIONS:
+    --layout NAME       Apply a named layout from ~/.cmux/layouts/<NAME>.json
+    --resume ID         Resume the given claude session id in the first tab
+    --continue          Spawn the first tab with `claude --continue`
+    -h, --help          Print this help and exit
+    -V, --version       Print version and exit",
+        ver = env!("CARGO_PKG_VERSION"),
+    );
+}
+
+/// Make sure `claude` (or `claude.cmd` on Windows) is somewhere on PATH so we
+/// can give a clear pre-raw-mode error instead of a cryptic PTY failure later.
+fn claude_on_path() -> bool {
+    let exe = if cfg!(windows) { "claude.cmd" } else { "claude" };
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path) {
+        if dir.join(exe).exists() {
+            return true;
+        }
+    }
+    false
+}
+
+// ===========================================================================
 // Entry
 // ===========================================================================
 fn main() -> Result<()> {
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(msg) => {
+            eprintln!("cmux: {}\n", msg);
+            print_usage();
+            std::process::exit(2);
+        }
+    };
+
+    if !claude_on_path() {
+        let exe = if cfg!(windows) { "claude.cmd" } else { "claude" };
+        eprintln!(
+            "cmux: cannot find `{}` on PATH.\n\nInstall Claude Code (https://claude.com/claude-code) \
+             and make sure the binary is on PATH, then re-run.",
+            exe
+        );
+        std::process::exit(127);
+    }
+
     config::ensure_default_written();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -1984,13 +2192,30 @@ fn main() -> Result<()> {
     let pty_rows = size.height.saturating_sub(CHROME_ROWS).max(1);
     let pty_cols = size.width.max(1);
 
-    let cwd = std::env::current_dir()?;
-    let mut app = App::new(cwd, pty_rows, pty_cols)?;
+    let launch_cwd = match &args.cwd {
+        Some(p) => p.clone(),
+        None => std::env::current_dir()?,
+    };
+    let mut app = App::new(launch_cwd, pty_rows, pty_cols)?;
 
-    // Auto-restore: if the user opted in and a saved layout exists, replace
-    // the default freshly-spawned tab with the saved set before entering the
-    // run loop. Failures here are non-fatal — we fall back to the default tab.
-    if app.config.layout.auto_restore && app.saved_layout.is_some() {
+    // CLI-driven first-tab overrides: --resume / --continue replace the
+    // default tab with a flavoured spawn before the run loop starts.
+    if let Some(id) = &args.resume {
+        if let Err(e) = app.cli_replace_default_with_resume(id, pty_rows, pty_cols) {
+            eprintln!("cmux: --resume failed: {}", e);
+        }
+    } else if args.continue_last {
+        if let Err(e) = app.cli_replace_default_with_continue(pty_rows, pty_cols) {
+            eprintln!("cmux: --continue failed: {}", e);
+        }
+    }
+
+    // --layout overrides everything: drain whatever's there and apply the
+    // named layout. Falls back silently to the current tab if missing.
+    if let Some(name) = &args.layout {
+        let _ = app.switch_to_layout(name, pty_rows, pty_cols);
+    } else if app.config.layout.auto_restore && app.saved_layout.is_some() {
+        // Auto-restore: same as before, only when --layout wasn't given.
         let _ = app.restore_layout(pty_rows, pty_cols);
     }
 
@@ -4625,6 +4850,12 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
         }
         Action::ToggleActiveProjectPin => {
             app.toggle_active_project_pin();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::NewTabContinue => {
+            app.open_tab_continue(pty_area.height.max(1), pty_area.width.max(1))?;
+            app.on_active_changed();
+            app.save_layout();
             Ok(KeyOutcome::LayoutChanged)
         }
         Action::Quit => Ok(KeyOutcome::Quit),
