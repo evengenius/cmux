@@ -521,7 +521,6 @@ struct App {
     new_tab_rect: Option<Rect>,
     // sessions sidebar
     sessions: Vec<SessionMeta>,
-    sessions_loaded: bool,
     sidebar_open: bool,
     sidebar_focused: bool,
     sidebar_mode: SidebarMode,
@@ -586,7 +585,6 @@ impl App {
             tab_rects: Vec::new(),
             new_tab_rect: None,
             sessions: Vec::new(),
-            sessions_loaded: false,
             sidebar_open: false,
             sidebar_focused: false,
             sidebar_mode: SidebarMode::Sessions,
@@ -708,16 +706,22 @@ impl App {
             return;
         }
         self.sidebar_mode = SidebarMode::Sessions;
-        if !self.sessions_loaded {
-            let root = sessions::claude_projects_root();
-            self.sessions = sessions::enumerate(&root);
-            self.sessions_loaded = true;
-        }
+        // Always re-enumerate on open so new/closed sessions show up. The
+        // scan is cheap (<50ms for hundreds of files) and beats the surprise
+        // of "I started another tab two hours ago and it isn't here".
+        self.refresh_sessions();
         self.sidebar_open = true;
         self.sidebar_focused = true;
         self.sidebar_idx = 0;
         self.sidebar_scroll = 0;
         self.apply_filter();
+    }
+
+    /// Re-scan `~/.claude/projects/` and replace `self.sessions`. Used by F3
+    /// open, palette open, and Ctrl+R inside the sessions sidebar.
+    fn refresh_sessions(&mut self) {
+        let root = sessions::claude_projects_root();
+        self.sessions = sessions::enumerate(&root);
     }
 
     fn toggle_commands_sidebar(&mut self) {
@@ -1024,12 +1028,9 @@ impl App {
     }
 
     fn open_palette(&mut self) {
-        // Load sessions lazily, same as F3 sidebar.
-        if !self.sessions_loaded {
-            let root = sessions::claude_projects_root();
-            self.sessions = sessions::enumerate(&root);
-            self.sessions_loaded = true;
-        }
+        // Always re-enumerate so the session list in the palette matches
+        // what's actually on disk right now.
+        self.refresh_sessions();
         self.rebuild_palette_items();
         self.palette_query.clear();
         self.palette_idx = 0;
@@ -2581,6 +2582,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("Alt+1..9",      "Switch to tab N"),
         ("Alt+←/→",       "Prev / next tab"),
         ("PgUp/PgDn",     "Scroll PTY history (when claude focused)"),
+        ("Ctrl+R (in F3)","Refresh session list from disk"),
         ("Esc (sidebar)", "Unfocus sidebar (keep visible)"),
         ("Esc (bottom)",  "Unfocus bottom shell (keep visible)"),
         ("Sidebar Enter", "Files: cd / Open here · Sessions: resume · Commands: submit"),
@@ -3340,6 +3342,13 @@ fn handle_key(
             KeyCode::Enter => {
                 app.open_selected_session(pty_area.height.max(1), pty_area.width.max(1))?;
                 return Ok(KeyOutcome::LayoutChanged);
+            }
+            // Ctrl+R — refresh the session list from disk without closing.
+            KeyCode::Char('r') | KeyCode::Char('R') if ctrl => {
+                app.refresh_sessions();
+                app.sidebar_idx = 0;
+                app.sidebar_scroll = 0;
+                app.apply_filter();
             }
             KeyCode::Backspace if app.filter.pop().is_some() => {
                 app.apply_filter();
