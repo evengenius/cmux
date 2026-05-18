@@ -37,7 +37,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Terminal,
 };
 use tui_term::widget::PseudoTerminal;
@@ -2193,8 +2193,29 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(main_color))
                     .title(if main_focused { " chat ● " } else { " chat ○ " });
-                let pty_area = main_block.inner(pty_area_outer);
+                let inner_area = main_block.inner(pty_area_outer);
                 f.render_widget(main_block, pty_area_outer);
+
+                // Reserve the rightmost column for a vertical scrollbar — the
+                // PTY itself renders to (width - 1) and is resized
+                // accordingly via the `last_pty_area` propagation below.
+                let scrollbar_w: u16 = if inner_area.width > 4 { 1 } else { 0 };
+                let pty_area = Rect {
+                    x: inner_area.x,
+                    y: inner_area.y,
+                    width: inner_area.width.saturating_sub(scrollbar_w),
+                    height: inner_area.height,
+                };
+                let scrollbar_area = if scrollbar_w > 0 {
+                    Some(Rect {
+                        x: inner_area.x + pty_area.width,
+                        y: inner_area.y,
+                        width: scrollbar_w,
+                        height: inner_area.height,
+                    })
+                } else {
+                    None
+                };
 
                 last_pty_area = pty_area;
                 app.bottom_area = bottom_pane_area.unwrap_or_default();
@@ -2222,6 +2243,29 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
 
                 let scroll_off = p.screen().scrollback();
                 drop(p);
+
+                // Vertical scrollbar on the right edge of the chat area.
+                // Position maps offset (rows above bottom) → distance from
+                // bottom of the bar. content_length stays at SCROLLBACK_LINES
+                // for a stable visual range; the thumb auto-sizes from the
+                // ratio of viewport_content_length to content_length.
+                if let Some(sb_area) = scrollbar_area {
+                    let visible = pty_area.height as usize;
+                    let mut state = ScrollbarState::new(SCROLLBACK_LINES)
+                        .position(SCROLLBACK_LINES.saturating_sub(scroll_off))
+                        .viewport_content_length(visible.max(1));
+                    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .begin_symbol(Some("▲"))
+                        .end_symbol(Some("▼"))
+                        .track_symbol(Some("│"))
+                        .thumb_symbol("█")
+                        .style(if scroll_off > 0 {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        });
+                    f.render_stateful_widget(bar, sb_area, &mut state);
+                }
 
                 let info_tag = if scroll_off > 0 {
                     Some(format!("SCROLL -{}", scroll_off))
