@@ -2254,9 +2254,17 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 // ratio of viewport_content_length to content_length.
                 if let Some(sb_area) = scrollbar_area {
                     let visible = pty_area.height as usize;
-                    let mut state = ScrollbarState::new(SCROLLBACK_LINES)
-                        .position(SCROLLBACK_LINES.saturating_sub(scroll_off))
-                        .viewport_content_length(visible.max(1));
+                    // Content length = real plain-text buffer of the active
+                    // tab, clamped so it's never below the viewport (otherwise
+                    // ratatui's math collapses the thumb).
+                    let total = active_total_lines(app).max(visible.max(1));
+                    let track_max = total.saturating_sub(visible);
+                    // position = index of the topmost visible row in content;
+                    // bottom of the bar (= live tail) when scroll_off == 0.
+                    let position = track_max.saturating_sub(scroll_off);
+                    let mut state = ScrollbarState::new(total)
+                        .viewport_content_length(visible.max(1))
+                        .position(position);
                     let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                         .begin_symbol(Some("▲"))
                         .end_symbol(Some("▼"))
@@ -4849,7 +4857,8 @@ fn handle_key(
 // ===========================================================================
 /// Map a mouse row over the scrollbar to a vt100 scrollback offset and apply
 /// it to the active tab. Top of the bar ≈ oldest scrollback (max offset),
-/// bottom ≈ live tail (offset 0).
+/// bottom ≈ live tail (offset 0). Uses the active tab's actual text-buffer
+/// length so the gesture matches whatever's really scrollable.
 fn set_scrollback_from_mouse_row(app: &mut App, row: u16, pty_area: Rect) {
     if pty_area.height == 0 {
         return;
@@ -4857,10 +4866,12 @@ fn set_scrollback_from_mouse_row(app: &mut App, row: u16, pty_area: Rect) {
     let raw = row.saturating_sub(pty_area.y) as usize;
     let height = pty_area.height as usize;
     let row_in_bar = raw.min(height.saturating_sub(1));
-    let offset = if height <= 1 {
+    let total = active_total_lines(app);
+    let track_max = total.saturating_sub(height);
+    let offset = if height <= 1 || track_max == 0 {
         0
     } else {
-        SCROLLBACK_LINES * (height - 1 - row_in_bar) / (height - 1)
+        track_max * (height - 1 - row_in_bar) / (height - 1)
     };
     let capped = offset.min(SCROLLBACK_LINES);
     let tab = app.active_tab();
@@ -4868,6 +4879,15 @@ fn set_scrollback_from_mouse_row(app: &mut App, row: u16, pty_area: Rect) {
         p.set_scrollback(capped);
     }
     tab.dirty.store(true, Ordering::Release);
+}
+
+/// Active tab's known plain-text mirror line count. Used as content length
+/// for the scrollbar.
+fn active_total_lines(app: &App) -> usize {
+    app.tabs
+        .get(app.active)
+        .and_then(|t| t.text_buffer.lock().ok().map(|b| b.total_lines()))
+        .unwrap_or(0)
 }
 
 fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<Action>> {
