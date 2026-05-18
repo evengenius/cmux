@@ -84,6 +84,9 @@ enum Action {
     PrevProject,
     NextProject,
     SwitchProject(usize),
+    /// Open the file browser pinned to the active project's cwd; the user
+    /// picks a directory and Enter on "OpenHere" spawns a chat there.
+    OpenBrowserForNewProject,
     ReloadConfig,
     Quit,
 }
@@ -618,6 +621,9 @@ struct App {
     /// Mouse-hit map for the project bar: each entry is `(rect, project idx
     /// into `projects()`)`. Rebuilt every draw.
     project_rects: Vec<(Rect, usize)>,
+    /// Click rect for the `+` button on the project bar — opens the file
+    /// browser so the user can pick a directory for a new project.
+    new_project_rect: Option<Rect>,
     // sessions sidebar
     sessions: Vec<SessionMeta>,
     sidebar_open: bool,
@@ -695,6 +701,7 @@ impl App {
             chat_rects: Vec::new(),
             new_tab_rect: None,
             project_rects: Vec::new(),
+            new_project_rect: None,
             sessions: Vec::new(),
             sidebar_open: false,
             sidebar_focused: false,
@@ -1430,6 +1437,11 @@ impl App {
         push_action(&mut items, "★  Next chat (in project)", Action::NextTab);
         push_action(&mut items, "★  Previous project (Ctrl+F11)", Action::PrevProject);
         push_action(&mut items, "★  Next project (Ctrl+F12)", Action::NextProject);
+        push_action(
+            &mut items,
+            "★  New project — pick a directory in the file browser",
+            Action::OpenBrowserForNewProject,
+        );
         push_action(&mut items, "★  Toggle sessions sidebar", Action::ToggleSidebar);
         push_action(
             &mut items,
@@ -1600,6 +1612,15 @@ impl App {
             }
             self.browser_open = true;
         }
+    }
+
+    /// Open the file browser anchored at the active project's cwd so the user
+    /// can pick a directory for a new chat. Recreates the browser instance to
+    /// reset any prior navigation state.
+    fn open_browser_for_new_project(&mut self) {
+        let start = self.active_project_cwd();
+        self.browser = Some(FileBrowser::new(start, self.config.browser.show_hidden));
+        self.browser_open = true;
     }
 
     fn spawn_tab_here(&mut self, cwd: PathBuf, rows: u16, cols: u16) -> Result<()> {
@@ -1937,9 +1958,10 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 // --- project bar (row 0) ---
                 let projects = app.projects();
                 let active_project_idx = app.active_project_idx();
-                let (proj_line, proj_rects) =
+                let (proj_line, proj_rects, new_proj_rect) =
                     render_project_bar(&projects, active_project_idx, chunks[0]);
                 app.project_rects = proj_rects;
+                app.new_project_rect = new_proj_rect;
                 f.render_widget(
                     Paragraph::new(proj_line).style(Style::default().bg(Color::Black)),
                     chunks[0],
@@ -2205,7 +2227,7 @@ fn render_project_bar(
     projects: &[PathBuf],
     active_idx: usize,
     area: Rect,
-) -> (Line<'static>, Vec<(Rect, usize)>) {
+) -> (Line<'static>, Vec<(Rect, usize)>, Option<Rect>) {
     let mut spans: Vec<Span> = Vec::new();
     let mut rects: Vec<(Rect, usize)> = Vec::with_capacity(projects.len());
     let mut x = area.x;
@@ -2252,7 +2274,28 @@ fn render_project_bar(
         x = x.saturating_add(w + 1);
     }
 
-    (Line::from(spans), rects)
+    // "+ project" button: opens the file browser so the user can pick a dir.
+    let plus_label = " + project ";
+    let plus_w = plus_label.chars().count() as u16;
+    let new_project_rect = if x.saturating_add(plus_w) <= limit {
+        spans.push(Span::styled(
+            plus_label,
+            Style::default()
+                .bg(Color::Rgb(40, 40, 50))
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+        Some(Rect {
+            x,
+            y: area.y,
+            width: plus_w,
+            height: 1,
+        })
+    } else {
+        None
+    };
+
+    (Line::from(spans), rects, new_project_rect)
 }
 
 // ===========================================================================
@@ -3622,6 +3665,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("F11 / F12",     "Previous / next chat (within active project)"),
         ("Ctrl+F11/F12",  "Previous / next project"),
         ("Ctrl+Shift+1..9","Switch to project N"),
+        ("Click + project","Open file browser to pick a dir for a new chat"),
         ("Ctrl+B",        "Files sidebar (chroot to tab cwd)"),
         ("Ctrl+`",        "Bottom shell pane (parent shell)"),
         ("Ctrl+F",        "Search active tab's scrollback"),
@@ -4269,6 +4313,10 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.on_active_changed();
             Ok(KeyOutcome::Continue)
         }
+        Action::OpenBrowserForNewProject => {
+            app.open_browser_for_new_project();
+            Ok(KeyOutcome::LayoutChanged)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -4658,12 +4706,18 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
         app.bottom_focused = false;
     }
 
-    // Project bar (row 0) — click jumps to that project's first chat.
+    // Project bar (row 0) — click switches project; the trailing `+`
+    // opens the file browser to pick a directory for a new chat.
     if me.row == 0 {
         if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
             for &(r, proj_idx) in &app.project_rects {
                 if me.column >= r.x && me.column < r.x + r.width {
                     return Ok(Some(Action::SwitchProject(proj_idx)));
+                }
+            }
+            if let Some(nr) = app.new_project_rect {
+                if me.column >= nr.x && me.column < nr.x + nr.width {
+                    return Ok(Some(Action::OpenBrowserForNewProject));
                 }
             }
         }
