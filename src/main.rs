@@ -1040,32 +1040,48 @@ impl App {
     }
 
     /// Pop the most-recently-closed chat and spawn it back. Falls back to
-    /// `spawn_with_title` when no session_id is recorded.
+    /// `spawn_with_title` when no session_id is recorded. Inserts next to
+    /// the last sibling chat (same cwd) so the project grouping isn't
+    /// broken — a freshly reopened cmux chat slots back into its project
+    /// instead of dangling at the end.
     fn reopen_last_closed(&mut self, rows: u16, cols: u16) -> Result<bool> {
         let Some(c) = self.recently_closed.pop_back() else {
             return Ok(false);
         };
         let scrollback = self.config.layout.scrollback_lines;
+        // Title was already truncated when the snapshot was taken; don't
+        // re-truncate (avoid ellipsis-on-ellipsis cosmetic bug).
+        let title = c.title.clone();
         let mut tab = match &c.session_id {
             Some(id) => ChatTab::spawn_resume(
                 c.cwd.clone(),
                 id,
-                truncate(&c.title, 24),
+                title,
                 rows,
                 cols,
                 scrollback,
             )?,
             None => ChatTab::spawn_with_title(
                 c.cwd.clone(),
-                truncate(&c.title, 24),
+                title,
                 rows,
                 cols,
                 scrollback,
             )?,
         };
         tab.pinned = c.pinned;
-        self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
+        // Find the index of the LAST sibling sharing this cwd and insert
+        // right after it. If no sibling exists, append (new project).
+        let insert_at = self
+            .tabs
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, t)| t.cwd == c.cwd)
+            .map(|(i, _)| i + 1)
+            .unwrap_or(self.tabs.len());
+        self.tabs.insert(insert_at, tab);
+        self.active = insert_at;
         Ok(true)
     }
 
@@ -1355,7 +1371,9 @@ impl App {
     }
 
     /// Close every chat whose cwd equals `cwd`. No-op if doing so would empty
-    /// the tab list — at least one chat must remain alive.
+    /// the tab list — at least one chat must remain alive. Each closed chat
+    /// is pushed onto `recently_closed` (newest of the project ends up at the
+    /// top of the stack, so Ctrl+Shift+T undoes them in close order).
     fn close_project(&mut self, cwd: &Path) -> bool {
         let to_close: Vec<usize> = self
             .tabs
@@ -1365,6 +1383,21 @@ impl App {
             .collect();
         if to_close.is_empty() || to_close.len() >= self.tabs.len() {
             return false;
+        }
+        // Snapshot each tab onto the undo stack BEFORE removing.
+        for &idx in &to_close {
+            if let Some(t) = self.tabs.get(idx) {
+                let snap = ClosedTab {
+                    cwd: t.cwd.clone(),
+                    session_id: t.session_id.clone(),
+                    title: t.title.clone(),
+                    pinned: t.pinned,
+                };
+                if self.recently_closed.len() == RECENTLY_CLOSED_CAP {
+                    self.recently_closed.pop_front();
+                }
+                self.recently_closed.push_back(snap);
+            }
         }
         // Kill from the end so earlier indices stay valid.
         for idx in to_close.into_iter().rev() {
@@ -1506,24 +1539,32 @@ impl App {
 
     /// Dump the active tab's plain-text scrollback to the system clipboard.
     /// Result is shown via the usage modal (reused as a generic "info"
-    /// surface here).
+    /// surface here). The text_buffer mutex is dropped before formatting
+    /// so the reader thread doesn't stall during a large copy.
     fn copy_scrollback(&mut self) {
-        let text = self
+        // Phase 1: snapshot lines under the lock, release ASAP.
+        let snapshot: Vec<String> = self
             .tabs
             .get(self.active)
             .and_then(|t| {
                 t.text_buffer.lock().ok().map(|b| {
-                    let mut out = String::new();
-                    for i in 0..b.total_lines() {
+                    let n = b.total_lines();
+                    let mut v = Vec::with_capacity(n);
+                    for i in 0..n {
                         if let Some(line) = b.line(i) {
-                            out.push_str(line);
-                            out.push('\n');
+                            v.push(line.to_string());
                         }
                     }
-                    out
+                    v
                 })
             })
             .unwrap_or_default();
+        // Phase 2: build the final string outside the lock.
+        let mut text = String::with_capacity(snapshot.iter().map(|l| l.len() + 1).sum());
+        for line in &snapshot {
+            text.push_str(line);
+            text.push('\n');
+        }
         let msg = self.copy_to_clipboard_msg(&text, "scrollback");
         self.usage_lines = msg;
         self.usage_open = true;
@@ -1726,13 +1767,31 @@ impl App {
         };
         match action {
             PendingConfirm::UnpinAndCloseChat(idx) => {
-                if let Some(tab) = self.tabs.get_mut(idx) {
-                    tab.pinned = false;
+                // Snapshot with pinned: true BEFORE we unpin, so Ctrl+Shift+T
+                // restores the pinned state the user explicitly chose.
+                if idx < self.tabs.len() && self.tabs.len() > 1 {
+                    if let Some(t) = self.tabs.get(idx) {
+                        let snap = ClosedTab {
+                            cwd: t.cwd.clone(),
+                            session_id: t.session_id.clone(),
+                            title: t.title.clone(),
+                            pinned: true,
+                        };
+                        if self.recently_closed.len() == RECENTLY_CLOSED_CAP {
+                            self.recently_closed.pop_front();
+                        }
+                        self.recently_closed.push_back(snap);
+                    }
+                    // Drop the tab directly — bypass close_active so it
+                    // doesn't push a second (stale, pinned: false) snapshot.
+                    let mut t = self.tabs.remove(idx);
+                    t.kill();
+                    if self.active >= self.tabs.len() {
+                        self.active = self.tabs.len().saturating_sub(1);
+                    }
+                    self.on_active_changed();
+                    self.save_layout();
                 }
-                self.active = idx.min(self.tabs.len().saturating_sub(1));
-                self.close_active();
-                self.on_active_changed();
-                self.save_layout();
             }
             PendingConfirm::CloseProject(cwd) => {
                 self.close_project(&cwd);
@@ -6325,12 +6384,6 @@ fn handle_key(
         return execute_action(Action::ToggleSearch, app, pty_area);
     }
 
-    // Ctrl+L — send `/clear` to the active chat. claude itself handles
-    // the command; we're just a single-stroke shortcut for typing it.
-    if ctrl && matches!(k.code, KeyCode::Char('l') | KeyCode::Char('L')) {
-        return execute_action(Action::ClearActiveChat, app, pty_area);
-    }
-
     // While search overlay is open, swallow keys.
     if app.search.open {
         return handle_search_key(k, app);
@@ -6455,6 +6508,14 @@ fn handle_key(
     }
 
     // PTY-focused
+
+    // Ctrl+L — send `/clear` to the active chat. claude handles the command
+    // itself; we're a single-stroke shortcut for typing it. Placed AFTER all
+    // modal / sidebar / bottom-shell gates so we don't steal Ctrl+L from
+    // shells (where it traditionally clears the terminal).
+    if ctrl && matches!(k.code, KeyCode::Char('l') | KeyCode::Char('L')) {
+        return execute_action(Action::ClearActiveChat, app, pty_area);
+    }
 
     // Host scrollback
     match k.code {

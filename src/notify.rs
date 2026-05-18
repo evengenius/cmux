@@ -25,9 +25,16 @@ pub fn osc_notify(title: &str, body: &str) {
     let _ = out.flush();
 }
 
+/// Strip anything that could break an OSC sequence: ASCII control bytes
+/// (`<` 0x20 incl. `\n`, `\r`, BEL, ESC, NUL), DEL (0x7f), the C1 ST byte
+/// (0x9c), and `;` which is the OSC field separator. A user-supplied tab
+/// title containing a newline used to terminate the OSC early and corrupt
+/// the next render; this filter prevents that.
 fn sanitise(s: &str) -> String {
     s.chars()
-        .filter(|c| *c != '\x07' && *c != '\x1b' && *c != ';')
+        .filter(|&c| {
+            !c.is_control() && c != ';' && c != '\u{007f}' && c != '\u{009c}'
+        })
         .collect()
 }
 
