@@ -281,6 +281,11 @@ impl GlobalSessionsState {
 struct SearchState {
     open: bool,
     query: String,
+    /// True when `query` is interpreted as a regex. Toggled with Alt+R.
+    regex_mode: bool,
+    /// Last compile error for the regex query — shown in the overlay so the
+    /// user can fix the pattern instead of guessing why nothing matches.
+    regex_error: Option<String>,
     matches: Vec<scrollback_text::Match>,
     /// Index into `matches` of the currently focused hit.
     idx: usize,
@@ -293,9 +298,11 @@ impl SearchState {
     fn clear(&mut self) {
         self.open = false;
         self.query.clear();
+        self.regex_error = None;
         self.matches.clear();
         self.idx = 0;
         self.tab_idx = None;
+        // regex_mode is sticky — preserve user preference across opens.
     }
 }
 
@@ -1404,13 +1411,31 @@ impl App {
         let Some(tab_idx) = self.search.tab_idx else {
             return;
         };
+        // Compile the query first — a regex parse error stays visible in the
+        // overlay header so the user can fix the pattern.
+        let compiled = scrollback_text::Query::compile(
+            &self.search.query,
+            self.search.regex_mode,
+        );
+        let query = match compiled {
+            Ok(q) => {
+                self.search.regex_error = None;
+                q
+            }
+            Err(e) => {
+                self.search.regex_error = Some(e.to_string());
+                self.search.matches.clear();
+                self.search.idx = 0;
+                return;
+            }
+        };
         let Some(tab) = self.tabs.get(tab_idx) else {
             return;
         };
         let matches = tab
             .text_buffer
             .lock()
-            .map(|buf| buf.find_all(&self.search.query))
+            .map(|buf| buf.find_all(&query))
             .unwrap_or_default();
         self.search.matches = matches;
         self.search.idx = 0;
@@ -2500,7 +2525,12 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 // search is active. Only the currently visible window of
                 // vt100's screen needs scanning — fast.
                 if app.search.open && !app.search.query.is_empty() {
-                    paint_search_highlights(f, p.screen(), pty_area, &app.search.query);
+                    if let Ok(query) = scrollback_text::Query::compile(
+                        &app.search.query,
+                        app.search.regex_mode,
+                    ) {
+                        paint_search_highlights(f, p.screen(), pty_area, &query);
+                    }
                 }
 
                 let scroll_off = p.screen().scrollback();
@@ -2535,6 +2565,42 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                             Style::default().fg(Color::DarkGray)
                         });
                     f.render_stateful_widget(bar, sb_area, &mut state);
+
+                    // Paint a single-cell red marker per match row on top of
+                    // the scrollbar track. Lets you see at a glance where in
+                    // scrollback the hits are. Dedupe rows so dense clusters
+                    // don't redraw repeatedly.
+                    if app.search.open && !app.search.matches.is_empty() && sb_area.height > 2 {
+                        let track_h = sb_area.height.saturating_sub(2);
+                        let track_y0 = sb_area.y + 1;
+                        let mut painted = std::collections::HashSet::<u16>::new();
+                        for m in &app.search.matches {
+                            if total <= 1 {
+                                break;
+                            }
+                            let frac_num =
+                                (m.line_idx as u64) * (track_h.saturating_sub(1) as u64);
+                            let offset = (frac_num / ((total - 1) as u64)) as u16;
+                            let row = track_y0 + offset;
+                            if !painted.insert(row) {
+                                continue;
+                            }
+                            f.render_widget(
+                                Paragraph::new(Line::from(Span::styled(
+                                    "•",
+                                    Style::default()
+                                        .fg(Color::Red)
+                                        .add_modifier(Modifier::BOLD),
+                                ))),
+                                Rect {
+                                    x: sb_area.x,
+                                    y: row,
+                                    width: 1,
+                                    height: 1,
+                                },
+                            );
+                        }
+                    }
                 }
 
                 let info_tag = if scroll_off > 0 {
@@ -3042,6 +3108,11 @@ fn handle_search_key(k: crossterm::event::KeyEvent, app: &mut App) -> Result<Key
         // n/N work as case-sensitive next/prev like in vi-style searches.
         KeyCode::Char('n') if ctrl => app.search_next(),
         KeyCode::Char('p') if ctrl => app.search_prev(),
+        // Alt+R — toggle regex mode and re-compile.
+        KeyCode::Char('r') | KeyCode::Char('R') if alt => {
+            app.search.regex_mode = !app.search.regex_mode;
+            app.search_rerun();
+        }
         // Empty query + Backspace is a no-op; Esc is the documented close.
         KeyCode::Backspace if app.search.query.pop().is_some() => {
             app.search_rerun();
@@ -3788,10 +3859,9 @@ fn paint_search_highlights(
     f: &mut ratatui::Frame,
     screen: &vt100::Screen,
     pty_area: Rect,
-    query: &str,
+    query: &scrollback_text::Query,
 ) {
     let (rows, cols) = screen.size();
-    let q_lower = query.to_lowercase();
     let visible_rows = pty_area.height.min(rows);
 
     for row in 0..visible_rows {
@@ -3819,51 +3889,66 @@ fn paint_search_highlights(
         }
         byte_to_col.push(cols);
 
-        // Case-insensitive substring scan via lowercased haystack. Lowercase
-        // may change byte lengths (Turkish İ etc.), so map back through the
-        // ORIGINAL row's byte_to_col by re-finding the original substring.
-        let hay_lower = row_text.to_lowercase();
-        let mut start = 0;
-        while let Some(rel) = hay_lower[start..].find(&q_lower) {
-            let abs_lower_start = start + rel;
-            // Heuristic: lowercase doesn't shift positions for ASCII, which
-            // is the dominant case. Trust the position directly. For locales
-            // where it lies we just paint a slightly-wrong rect — cheap
-            // tradeoff for the simpler code.
-            let b_start = abs_lower_start.min(row_text.len());
-            let b_end = (abs_lower_start + q_lower.len()).min(row_text.len());
-            if b_end > b_start {
-                let col_start = byte_to_col.get(b_start).copied().unwrap_or(0);
-                let col_end = byte_to_col.get(b_end).copied().unwrap_or(cols);
-                let width = col_end.saturating_sub(col_start);
-                if width > 0 && col_start < pty_area.width {
-                    let w = width.min(pty_area.width - col_start);
-                    let highlight_text: String = row_cells
-                        [col_start as usize..(col_start + w) as usize]
-                        .concat();
-                    let rect = Rect {
-                        x: pty_area.x + col_start,
-                        y: pty_area.y + row,
-                        width: w,
-                        height: 1,
-                    };
-                    f.render_widget(
-                        Paragraph::new(Line::from(Span::styled(
-                            highlight_text,
-                            Style::default()
-                                .bg(Color::Yellow)
-                                .fg(Color::Black)
-                                .add_modifier(Modifier::BOLD),
-                        ))),
-                        rect,
-                    );
+        // Per-row match ranges as (byte_start, byte_end). Both query kinds
+        // produce these uniformly; the rest of the loop paints them.
+        let ranges: Vec<(usize, usize)> = match query {
+            scrollback_text::Query::Substring(q_lower) => {
+                let hay_lower = row_text.to_lowercase();
+                let mut out = Vec::new();
+                let mut start = 0;
+                while let Some(rel) = hay_lower[start..].find(q_lower.as_str()) {
+                    let abs = start + rel;
+                    let end = (abs + q_lower.len()).min(row_text.len());
+                    if end > abs {
+                        out.push((abs, end));
+                    }
+                    // Advance by at least one byte to avoid an infinite loop.
+                    let step = q_lower
+                        .chars()
+                        .next()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(1);
+                    start = abs + step;
+                    if start > hay_lower.len() {
+                        break;
+                    }
                 }
+                out
             }
-            // Advance by at least one byte to find subsequent matches.
-            start = abs_lower_start + q_lower.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-            if start > hay_lower.len() {
-                break;
+            scrollback_text::Query::Regex(re) => re
+                .find_iter(&row_text)
+                .filter(|m| !m.range().is_empty())
+                .map(|m| (m.start(), m.end()))
+                .collect(),
+        };
+
+        for (b_start, b_end) in ranges {
+            let col_start = byte_to_col.get(b_start).copied().unwrap_or(0);
+            let col_end = byte_to_col.get(b_end).copied().unwrap_or(cols);
+            let width = col_end.saturating_sub(col_start);
+            if width == 0 || col_start >= pty_area.width {
+                continue;
             }
+            let w = width.min(pty_area.width - col_start);
+            let highlight_text: String = row_cells
+                [col_start as usize..(col_start + w) as usize]
+                .concat();
+            let rect = Rect {
+                x: pty_area.x + col_start,
+                y: pty_area.y + row,
+                width: w,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    highlight_text,
+                    Style::default()
+                        .bg(Color::Yellow)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                rect,
+            );
         }
     }
 }
@@ -3886,19 +3971,26 @@ fn render_search_overlay(f: &mut ratatui::Frame, pty_area: Rect, app: &mut App) 
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(bar_area);
 
-    // Header row — input + match counter + hint.
-    let counter = if app.search.query.is_empty() {
+    // Header row — input + mode + counter/error + hint.
+    let mode_badge = if app.search.regex_mode {
+        " [regex] "
+    } else {
+        ""
+    };
+    let counter = if let Some(err) = &app.search.regex_error {
+        format!(" regex error: {} ", truncate(err, 32))
+    } else if app.search.query.is_empty() {
         " type to search ".to_string()
     } else if app.search.matches.is_empty() {
         " 0 matches ".to_string()
     } else {
         format!(" {}/{} ", app.search.idx + 1, app.search.matches.len())
     };
-    let hint = " ↑/↓ step · Esc close ";
+    let hint = " ↑/↓ step · Alt+R regex · Esc close ";
 
     // Reserve room on the right for counter + hint so the query doesn't push
     // them off-screen.
-    let right_w = counter.chars().count() + hint.chars().count();
+    let right_w = counter.chars().count() + hint.chars().count() + mode_badge.len();
     let q_max = (chunks[0].width as usize).saturating_sub(right_w + 4);
     let q_display = if app.search.query.chars().count() > q_max {
         let skip = app.search.query.chars().count() - q_max;
@@ -3907,21 +3999,34 @@ fn render_search_overlay(f: &mut ratatui::Frame, pty_area: Rect, app: &mut App) 
         app.search.query.clone()
     };
 
+    let counter_style = if app.search.regex_error.is_some() {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    };
+
     let header = Line::from(vec![
         Span::styled(
             " 🔍 ",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(
+            mode_badge,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(q_display, Style::default().fg(Color::White)),
         Span::styled("█", Style::default().fg(Color::Gray)),
         Span::raw(" "),
-        Span::styled(
-            counter,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(counter, counter_style),
         Span::styled(hint, Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(

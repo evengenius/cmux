@@ -36,6 +36,29 @@ pub struct Match {
     pub len: usize,
 }
 
+/// Compiled search query — either a case-insensitive substring or a regex.
+pub enum Query {
+    Substring(String), // already lowercased
+    Regex(regex::Regex),
+}
+
+impl Query {
+    /// Compile a user-typed `q` according to `regex_mode`. Substring queries
+    /// are lowercased once; the haystack is lowercased on the fly.
+    pub fn compile(q: &str, regex_mode: bool) -> std::result::Result<Self, regex::Error> {
+        if regex_mode {
+            // Default to case-insensitive — matches the substring path.
+            regex::RegexBuilder::new(q)
+                .case_insensitive(true)
+                .multi_line(false)
+                .build()
+                .map(Query::Regex)
+        } else {
+            Ok(Query::Substring(q.to_lowercase()))
+        }
+    }
+}
+
 impl ScrollbackText {
     /// Build with an explicit line cap. Used to honour `[layout].scrollback_lines`.
     pub fn with_capacity(max: usize) -> Self {
@@ -67,17 +90,27 @@ impl ScrollbackText {
         }
     }
 
-    /// Case-insensitive search for `query`. Returns matches in scan order.
-    pub fn find_all(&self, query: &str) -> Vec<Match> {
-        if query.is_empty() {
-            return Vec::new();
-        }
-        let q = query.to_lowercase();
+    /// Search for matches of `query` across the buffer. Returns hits in
+    /// scan order (oldest line first).
+    pub fn find_all(&self, query: &Query) -> Vec<Match> {
         let mut out = Vec::new();
-        for (i, line) in self.lines.iter().enumerate() {
-            collect_line_matches(&q, line, i, &mut out);
+        match query {
+            Query::Substring(q) => {
+                if q.is_empty() {
+                    return out;
+                }
+                for (i, line) in self.lines.iter().enumerate() {
+                    collect_substring_matches(q, line, i, &mut out);
+                }
+                collect_substring_matches(q, &self.current, self.lines.len(), &mut out);
+            }
+            Query::Regex(re) => {
+                for (i, line) in self.lines.iter().enumerate() {
+                    collect_regex_matches(re, line, i, &mut out);
+                }
+                collect_regex_matches(re, &self.current, self.lines.len(), &mut out);
+            }
         }
-        collect_line_matches(&q, &self.current, self.lines.len(), &mut out);
         out
     }
 
@@ -101,7 +134,12 @@ impl ScrollbackText {
     }
 }
 
-fn collect_line_matches(query_lc: &str, line: &str, line_idx: usize, out: &mut Vec<Match>) {
+fn collect_substring_matches(
+    query_lc: &str,
+    line: &str,
+    line_idx: usize,
+    out: &mut Vec<Match>,
+) {
     let lc = line.to_lowercase();
     let mut start = 0;
     while let Some(pos) = lc[start..].find(query_lc) {
@@ -118,6 +156,26 @@ fn collect_line_matches(query_lc: &str, line: &str, line_idx: usize, out: &mut V
         if start > line.len() {
             break;
         }
+    }
+}
+
+fn collect_regex_matches(
+    re: &regex::Regex,
+    line: &str,
+    line_idx: usize,
+    out: &mut Vec<Match>,
+) {
+    for m in re.find_iter(line) {
+        // Skip zero-length matches — they'd produce empty highlight rects
+        // and cause `find_iter` to loop without progress on some patterns.
+        if m.range().is_empty() {
+            continue;
+        }
+        out.push(Match {
+            line_idx,
+            col: m.start(),
+            len: m.len(),
+        });
     }
 }
 
@@ -211,7 +269,7 @@ mod tests {
     fn find_all_case_insensitive() {
         let mut s = ScrollbackText::default();
         s.feed(b"Hello World\nhello again\n");
-        let m = s.find_all("hello");
+        let m = s.find_all(&Query::compile("hello", false).unwrap());
         assert_eq!(m.len(), 2);
         assert_eq!(m[0].line_idx, 0);
         assert_eq!(m[0].col, 0);
@@ -222,7 +280,7 @@ mod tests {
     fn find_all_includes_current_line() {
         let mut s = ScrollbackText::default();
         s.feed(b"first\nstreaming part");
-        let m = s.find_all("stream");
+        let m = s.find_all(&Query::compile("stream", false).unwrap());
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].line_idx, 1);
     }
@@ -231,8 +289,27 @@ mod tests {
     fn multiple_matches_per_line() {
         let mut s = ScrollbackText::default();
         s.feed(b"ab ab ab\n");
-        let m = s.find_all("ab");
+        let m = s.find_all(&Query::compile("ab", false).unwrap());
         assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn regex_query() {
+        let mut s = ScrollbackText::default();
+        s.feed(b"foo123 bar456 baz789\nfoo000\n");
+        let m = s.find_all(&Query::compile(r"\d+", true).unwrap());
+        assert_eq!(m.len(), 4);
+        assert_eq!(m[0].line_idx, 0);
+        assert_eq!(m[0].col, 3);
+        assert_eq!(m[0].len, 3);
+    }
+
+    #[test]
+    fn regex_case_insensitive_default() {
+        let mut s = ScrollbackText::default();
+        s.feed(b"Hello WORLD\n");
+        let m = s.find_all(&Query::compile("hello", true).unwrap());
+        assert_eq!(m.len(), 1);
     }
 
     #[test]
