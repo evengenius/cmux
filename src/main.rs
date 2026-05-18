@@ -730,7 +730,15 @@ impl App {
     }
 
     fn open_tab(&mut self, rows: u16, cols: u16) -> Result<()> {
-        let tab = ChatTab::spawn(self.cwd.clone(), rows, cols)?;
+        // Spawn the new tab in the active tab's cwd — this is what the
+        // user usually means by F2 ("another chat in this project"). Falls
+        // back to the launch cwd if there are no tabs (shouldn't happen).
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        let tab = ChatTab::spawn(cwd, rows, cols)?;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         Ok(())
