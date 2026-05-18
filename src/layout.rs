@@ -13,6 +13,11 @@ pub struct SavedLayout {
     pub sidebar_open: bool,
     #[serde(default)]
     pub bottom_open: bool,
+    /// cwds of projects the user pinned. Project pinning lives outside the
+    /// per-tab struct because "project" is derived from tabs' cwds — one
+    /// pin flag per unique cwd, not per tab.
+    #[serde(default)]
+    pub pinned_projects: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

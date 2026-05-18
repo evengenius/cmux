@@ -90,6 +90,7 @@ enum Action {
     /// Open the file browser pinned to the active project's cwd; the user
     /// picks a directory and Enter on "OpenHere" spawns a chat there.
     OpenBrowserForNewProject,
+    ToggleActiveProjectPin,
     ReloadConfig,
     Quit,
 }
@@ -181,6 +182,33 @@ enum PaletteResult {
     OpenSession(usize),
     SwitchLayout(usize),
     DeleteLayout(usize),
+}
+
+// ===========================================================================
+// Confirm modal — small Y/N prompt used before destructive actions
+// (closing a pinned chat or closing a whole project).
+// ===========================================================================
+#[derive(Clone)]
+enum PendingConfirm {
+    /// Unpin then close the chat at this global index.
+    UnpinAndCloseChat(usize),
+    /// Close every chat whose cwd equals this path.
+    CloseProject(PathBuf),
+}
+
+#[derive(Default)]
+struct ConfirmState {
+    open: bool,
+    message: String,
+    pending: Option<PendingConfirm>,
+}
+
+impl ConfirmState {
+    fn clear(&mut self) {
+        self.open = false;
+        self.message.clear();
+        self.pending = None;
+    }
 }
 
 // ===========================================================================
@@ -627,6 +655,13 @@ struct App {
     /// Click rect for the `+` button on the project bar — opens the file
     /// browser so the user can pick a directory for a new project.
     new_project_rect: Option<Rect>,
+    /// cwds of projects the user has pinned. Pinned projects show 📌 on the
+    /// project bar and require confirmation to close.
+    pinned_projects: std::collections::HashSet<PathBuf>,
+    /// Last left-button-down on a project entry — same role as
+    /// `last_chat_click` but for the project bar, used to detect
+    /// "double-click close" on a project.
+    last_project_click: Option<(Instant, PathBuf)>,
     // sessions sidebar
     sessions: Vec<SessionMeta>,
     sidebar_open: bool,
@@ -689,6 +724,8 @@ struct App {
     save_as_open: bool,
     save_as_input: String,
     save_as_error: Option<String>,
+    // confirm modal for destructive actions
+    confirm: ConfirmState,
     // named layouts in ~/.cmux/layouts/, refreshed on palette open
     layout_names: Vec<String>,
     // persisted layout (if any was found at startup)
@@ -708,6 +745,8 @@ impl App {
             new_tab_rect: None,
             project_rects: Vec::new(),
             new_project_rect: None,
+            pinned_projects: std::collections::HashSet::new(),
+            last_project_click: None,
             sessions: Vec::new(),
             sidebar_open: false,
             sidebar_focused: false,
@@ -752,6 +791,7 @@ impl App {
             save_as_open: false,
             save_as_input: String::new(),
             save_as_error: None,
+            confirm: ConfirmState::default(),
             layout_names: Vec::new(),
             saved_layout: layout::load(),
             config: config::load(),
@@ -1088,6 +1128,47 @@ impl App {
         }
     }
 
+    fn is_project_pinned(&self, cwd: &Path) -> bool {
+        self.pinned_projects.contains(cwd)
+    }
+
+    fn toggle_active_project_pin(&mut self) {
+        let cwd = self.active_project_cwd();
+        if self.pinned_projects.contains(&cwd) {
+            self.pinned_projects.remove(&cwd);
+        } else {
+            self.pinned_projects.insert(cwd);
+        }
+        self.save_layout();
+    }
+
+    /// Close every chat whose cwd equals `cwd`. No-op if doing so would empty
+    /// the tab list — at least one chat must remain alive.
+    fn close_project(&mut self, cwd: &Path) -> bool {
+        let to_close: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| if t.cwd == cwd { Some(i) } else { None })
+            .collect();
+        if to_close.is_empty() || to_close.len() >= self.tabs.len() {
+            return false;
+        }
+        // Kill from the end so earlier indices stay valid.
+        for idx in to_close.into_iter().rev() {
+            let mut t = self.tabs.remove(idx);
+            t.kill();
+            if self.active > idx {
+                self.active -= 1;
+            } else if self.active == idx && self.active >= self.tabs.len() {
+                self.active = self.tabs.len() - 1;
+            }
+        }
+        self.pinned_projects.remove(cwd);
+        self.save_layout();
+        true
+    }
+
     // -- tab rename (Shift+F2) ---------------------------------------------
 
     fn open_rename(&mut self) {
@@ -1201,6 +1282,38 @@ impl App {
             Some(GlobalEntry::Session(i)) => Some(*i),
             _ => None,
         }
+    }
+
+    // -- confirm modal -----------------------------------------------------
+
+    fn ask_confirm(&mut self, message: String, pending: PendingConfirm) {
+        self.confirm.message = message;
+        self.confirm.pending = Some(pending);
+        self.confirm.open = true;
+    }
+
+    /// Execute the pending action committed via Y/Enter in the confirm modal.
+    fn apply_confirm(&mut self) {
+        let Some(action) = self.confirm.pending.take() else {
+            self.confirm.clear();
+            return;
+        };
+        match action {
+            PendingConfirm::UnpinAndCloseChat(idx) => {
+                if let Some(tab) = self.tabs.get_mut(idx) {
+                    tab.pinned = false;
+                }
+                self.active = idx.min(self.tabs.len().saturating_sub(1));
+                self.close_active();
+                self.on_active_changed();
+                self.save_layout();
+            }
+            PendingConfirm::CloseProject(cwd) => {
+                self.close_project(&cwd);
+                self.on_active_changed();
+            }
+        }
+        self.confirm.clear();
     }
 
     // -- save layout as (palette) ------------------------------------------
@@ -1449,6 +1562,12 @@ impl App {
             "★  New project — pick a directory in the file browser",
             Action::OpenBrowserForNewProject,
         );
+        let project_pin_label = if self.is_project_pinned(&self.active_project_cwd()) {
+            "★  Unpin active project"
+        } else {
+            "★  Pin active project"
+        };
+        push_action(&mut items, project_pin_label, Action::ToggleActiveProjectPin);
         push_action(&mut items, "★  Toggle sessions sidebar", Action::ToggleSidebar);
         push_action(
             &mut items,
@@ -1695,6 +1814,7 @@ impl App {
             self.bottom = Some(BottomTerminal::spawn(h, 80, shell_override, bottom_cwd)?);
             self.bottom_open = true;
         }
+        self.pinned_projects = saved.pinned_projects.into_iter().collect();
         self.save_layout(); // overwrite the unnamed/auto layout with current state
         Ok(())
     }
@@ -1746,6 +1866,7 @@ impl App {
             tabs: saved_tabs,
             sidebar_open: self.sidebar_open,
             bottom_open: self.bottom_open,
+            pinned_projects: self.pinned_projects.iter().cloned().collect(),
         }
     }
 
@@ -1965,8 +2086,12 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 // --- project bar (row 0) ---
                 let projects = app.projects();
                 let active_project_idx = app.active_project_idx();
-                let (proj_line, proj_rects, new_proj_rect) =
-                    render_project_bar(&projects, active_project_idx, chunks[0]);
+                let (proj_line, proj_rects, new_proj_rect) = render_project_bar(
+                    &projects,
+                    active_project_idx,
+                    &app.pinned_projects,
+                    chunks[0],
+                );
                 app.project_rects = proj_rects;
                 app.new_project_rect = new_proj_rect;
                 f.render_widget(
@@ -2143,6 +2268,9 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 if app.save_as_open {
                     render_save_as_modal(f, f.area(), app);
                 }
+                if app.confirm.open {
+                    render_confirm_modal(f, f.area(), app);
+                }
             })?;
             needs_draw = false;
         }
@@ -2233,6 +2361,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
 fn render_project_bar(
     projects: &[PathBuf],
     active_idx: usize,
+    pinned: &std::collections::HashSet<PathBuf>,
     area: Rect,
 ) -> (Line<'static>, Vec<(Rect, usize)>, Option<Rect>) {
     let mut spans: Vec<Span> = Vec::new();
@@ -2254,7 +2383,8 @@ fn render_project_bar(
             .and_then(|s| s.to_str())
             .unwrap_or_else(|| p.to_str().unwrap_or(""))
             .to_string();
-        let label = format!(" {}: {} ", i + 1, truncate(&name, 20));
+        let pin_prefix = if pinned.contains(p) { "📌 " } else { "" };
+        let label = format!(" {}{}: {} ", pin_prefix, i + 1, truncate(&name, 20));
         let w = label.chars().count() as u16;
         if x.saturating_add(w) > limit {
             break;
@@ -2493,6 +2623,22 @@ fn handle_global_sessions_key(
         _ => {}
     }
     Ok(KeyOutcome::Continue)
+}
+
+// ===========================================================================
+// Confirm modal key handler
+// ===========================================================================
+fn handle_confirm_key(k: crossterm::event::KeyEvent, app: &mut App) -> Result<KeyOutcome> {
+    match k.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            app.apply_confirm();
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.confirm.clear();
+        }
+        _ => {}
+    }
+    Ok(KeyOutcome::LayoutChanged)
 }
 
 // ===========================================================================
@@ -3110,6 +3256,51 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
 }
 
 // ===========================================================================
+// Confirm modal — small centered Y/N prompt.
+// ===========================================================================
+fn render_confirm_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
+    let w = 72u16.min(full_area.width.saturating_sub(4));
+    let h = 5u16;
+    if w < 20 || full_area.height < h + 2 {
+        return;
+    }
+    let x = full_area.x + (full_area.width.saturating_sub(w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Confirm  ·  Y / Enter — yes · N / Esc — no ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(Color::Rgb(30, 20, 20)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    let msg = truncate(&app.confirm.message, w as usize - 4);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {} ", msg),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ))),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Press Y to confirm · N to cancel ",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[1],
+    );
+}
+
+// ===========================================================================
 // Save-layout-as modal — centered prompt for a layout name.
 // ===========================================================================
 fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
@@ -3678,8 +3869,9 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("Ctrl+F",        "Search active tab's scrollback"),
         ("Shift+F2",      "Rename active tab"),
         ("Drag tab",      "Reorder tabs (mouse down on one, up on another)"),
-        ("Double-click",  "Close that chat (pinned chats refuse)"),
+        ("Double-click",  "Close that chat (pinned → ask confirmation)"),
         ("Right-click",   "Rename that chat (opens the rename modal)"),
+        ("2× project",    "Close entire project (asks confirmation)"),
         ("Pin via F9",    "Pinned tabs refuse to close (📌 prefix)"),
         ("Ctrl+Q",        "Quit"),
         ("Ctrl+PgUp/PgDn","Prev / next tab"),
@@ -4219,6 +4411,18 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             Ok(KeyOutcome::Continue)
         }
         Action::CloseTab => {
+            // Pinned active tabs route through the confirm modal; close_active
+            // itself silently refuses pinned, so we'd otherwise just no-op.
+            let idx = app.active;
+            let is_pinned = app.tabs.get(idx).map(|t| t.pinned).unwrap_or(false);
+            if is_pinned && app.tabs.len() > 1 {
+                let title = app.tabs[idx].title.clone();
+                app.ask_confirm(
+                    format!("Close pinned chat \"{}\"?", title),
+                    PendingConfirm::UnpinAndCloseChat(idx),
+                );
+                return Ok(KeyOutcome::LayoutChanged);
+            }
             app.close_active();
             app.on_active_changed();
             app.save_layout();
@@ -4326,6 +4530,10 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.open_browser_for_new_project();
             Ok(KeyOutcome::LayoutChanged)
         }
+        Action::ToggleActiveProjectPin => {
+            app.toggle_active_project_pin();
+            Ok(KeyOutcome::LayoutChanged)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -4373,6 +4581,11 @@ fn handle_key(
     // Save-layout-as modal eats keys while open.
     if app.save_as_open {
         return handle_save_as_key(k, app);
+    }
+
+    // Confirm modal — top priority once visible.
+    if app.confirm.open {
+        return handle_confirm_key(k, app);
     }
 
     // Shift+F3 toggles the global-sessions modal.
@@ -4715,12 +4928,57 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
         app.bottom_focused = false;
     }
 
-    // Project bar (row 0) — click switches project; the trailing `+`
-    // opens the file browser to pick a directory for a new chat.
+    // Project bar (row 0):
+    //   left-click       — switch project (jump to its first chat)
+    //   left-click × 2   — close the project (asks for confirmation)
+    //   trailing `+`     — open file browser to pick a dir for a new chat
     if me.row == 0 {
         if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
             for &(r, proj_idx) in &app.project_rects {
                 if me.column >= r.x && me.column < r.x + r.width {
+                    let projs = app.projects();
+                    let Some(cwd) = projs.get(proj_idx).cloned() else {
+                        return Ok(None);
+                    };
+                    let now = Instant::now();
+                    let is_double = app
+                        .last_project_click
+                        .as_ref()
+                        .map(|(when, target)| {
+                            *target == cwd
+                                && now.duration_since(*when).as_millis() < DOUBLE_CLICK_MS
+                        })
+                        .unwrap_or(false);
+                    if is_double {
+                        app.last_project_click = None;
+                        // Multi-chat close always asks — too much to throw
+                        // away on a misclick. Pinned vs unpinned shows in
+                        // the message but doesn't change the gating.
+                        let pin_note = if app.is_project_pinned(&cwd) {
+                            " (pinned)"
+                        } else {
+                            ""
+                        };
+                        let chat_count = app
+                            .tabs
+                            .iter()
+                            .filter(|t| t.cwd == cwd)
+                            .count();
+                        let name = cwd
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_else(|| cwd.to_str().unwrap_or(""))
+                            .to_string();
+                        app.ask_confirm(
+                            format!(
+                                "Close project \"{}\"{} — {} chat(s) will be killed.",
+                                name, pin_note, chat_count
+                            ),
+                            PendingConfirm::CloseProject(cwd),
+                        );
+                        return Ok(None);
+                    }
+                    app.last_project_click = Some((now, cwd));
                     return Ok(Some(Action::SwitchProject(proj_idx)));
                 }
             }
@@ -4755,11 +5013,22 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
                             // Consume the click — don't let a third click cascade.
                             app.last_chat_click = None;
                             app.active = global_idx;
-                            // close_active refuses pinned tabs and the last
-                            // tab, both of which we just silently ignore.
-                            app.close_active();
-                            app.on_active_changed();
-                            app.save_layout();
+                            let is_pinned = app
+                                .tabs
+                                .get(global_idx)
+                                .map(|t| t.pinned)
+                                .unwrap_or(false);
+                            if is_pinned {
+                                let title = app.tabs[global_idx].title.clone();
+                                app.ask_confirm(
+                                    format!("Close pinned chat \"{}\"?", title),
+                                    PendingConfirm::UnpinAndCloseChat(global_idx),
+                                );
+                            } else {
+                                app.close_active();
+                                app.on_active_changed();
+                                app.save_layout();
+                            }
                             return Ok(None);
                         }
                         app.last_chat_click = Some((now, global_idx));
