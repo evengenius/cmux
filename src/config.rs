@@ -54,6 +54,13 @@ pub struct NotifyConfig {
     /// silently ignored on other OSes.
     #[serde(default = "default_true")]
     pub toast: bool,
+    /// Emit OSC 9 (iTerm2 / Windows Terminal) and OSC 777 (Konsole)
+    /// notification escape sequences. Off by default because terminals
+    /// that don't recognise them still don't display anything useful;
+    /// users on iTerm2 / Konsole / KDE get free Notification Center
+    /// integration by flipping this on.
+    #[serde(default)]
+    pub osc: bool,
 }
 
 fn default_true() -> bool {
@@ -65,6 +72,7 @@ impl Default for NotifyConfig {
         Self {
             bell: true,
             toast: true,
+            osc: false,
         }
     }
 }
@@ -241,6 +249,10 @@ bell = true
 # PowerShell + WinRT call — no extra dependencies. Silently no-op on
 # non-Windows.
 toast = true
+# OSC 9 / OSC 777 escape sequences — iTerm2 and Konsole surface these as
+# native system notifications. Off by default because most terminals
+# ignore them and a few render the escape as visible garbage.
+osc = false
 
 [theme]
 # Accent colour. Used for: active-project highlight on the project bar,

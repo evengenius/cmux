@@ -1,4 +1,5 @@
 mod browser;
+mod clipboard;
 mod commands;
 mod config;
 mod grep;
@@ -107,6 +108,17 @@ enum Action {
     ShowActiveUsage,
     /// Open the `git diff` viewer modal for the active tab's cwd.
     ShowGitDiff,
+    /// Send `/clear<Enter>` to the active chat — same as typing the slash
+    /// command manually, but a single Ctrl+L stroke.
+    ClearActiveChat,
+    /// Copy the active chat's full scrollback (plain-text mirror) to the
+    /// system clipboard. Reports success / failure via the usage modal.
+    CopyChatScrollback,
+    /// Copy the last assistant message in the active chat's jsonl to the
+    /// system clipboard.
+    CopyLastResponse,
+    /// Pop the most recently closed chat off the undo stack and respawn it.
+    ReopenLastClosed,
     ReloadConfig,
     Quit,
 }
@@ -202,6 +214,20 @@ enum PaletteResult {
     SwitchLayout(usize),
     DeleteLayout(usize),
 }
+
+// ===========================================================================
+// Recently-closed chat (Ctrl+Shift+T reopens) — snapshot of just enough to
+// respawn the same session.
+// ===========================================================================
+#[derive(Clone)]
+struct ClosedTab {
+    cwd: PathBuf,
+    session_id: Option<String>,
+    title: String,
+    pinned: bool,
+}
+
+const RECENTLY_CLOSED_CAP: usize = 10;
 
 // ===========================================================================
 // Broadcast modal — type once, submit to every chat in the active project.
@@ -743,6 +769,9 @@ struct App {
     /// cwds of projects the user has pinned. Pinned projects show 📌 on the
     /// project bar and require confirmation to close.
     pinned_projects: std::collections::HashSet<PathBuf>,
+    /// LIFO stack of recently closed chats. `close_active` pushes onto it;
+    /// `Action::ReopenLastClosed` pops and respawns. Capped at 10 entries.
+    recently_closed: std::collections::VecDeque<ClosedTab>,
     /// Last left-button-down on a project entry — same role as
     /// `last_chat_click` but for the project bar, used to detect
     /// "double-click close" on a project.
@@ -849,6 +878,7 @@ impl App {
             project_rects: Vec::new(),
             new_project_rect: None,
             pinned_projects: std::collections::HashSet::new(),
+            recently_closed: std::collections::VecDeque::with_capacity(10),
             last_project_click: None,
             sessions: Vec::new(),
             sidebar_open: false,
@@ -988,12 +1018,55 @@ impl App {
         if self.tabs.get(self.active).map(|t| t.pinned).unwrap_or(false) {
             return false;
         }
+        // Snapshot for the undo stack BEFORE we drop the tab.
+        let snapshot = self.tabs.get(self.active).map(|t| ClosedTab {
+            cwd: t.cwd.clone(),
+            session_id: t.session_id.clone(),
+            title: t.title.clone(),
+            pinned: t.pinned,
+        });
+        if let Some(snap) = snapshot {
+            if self.recently_closed.len() == RECENTLY_CLOSED_CAP {
+                self.recently_closed.pop_front();
+            }
+            self.recently_closed.push_back(snap);
+        }
         let mut t = self.tabs.remove(self.active);
         t.kill();
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
         true
+    }
+
+    /// Pop the most-recently-closed chat and spawn it back. Falls back to
+    /// `spawn_with_title` when no session_id is recorded.
+    fn reopen_last_closed(&mut self, rows: u16, cols: u16) -> Result<bool> {
+        let Some(c) = self.recently_closed.pop_back() else {
+            return Ok(false);
+        };
+        let scrollback = self.config.layout.scrollback_lines;
+        let mut tab = match &c.session_id {
+            Some(id) => ChatTab::spawn_resume(
+                c.cwd.clone(),
+                id,
+                truncate(&c.title, 24),
+                rows,
+                cols,
+                scrollback,
+            )?,
+            None => ChatTab::spawn_with_title(
+                c.cwd.clone(),
+                truncate(&c.title, 24),
+                rows,
+                cols,
+                scrollback,
+            )?,
+        };
+        tab.pinned = c.pinned;
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        Ok(true)
     }
 
     fn next_tab(&mut self) {
@@ -1429,6 +1502,73 @@ impl App {
         self.confirm.message = message;
         self.confirm.pending = Some(pending);
         self.confirm.open = true;
+    }
+
+    /// Dump the active tab's plain-text scrollback to the system clipboard.
+    /// Result is shown via the usage modal (reused as a generic "info"
+    /// surface here).
+    fn copy_scrollback(&mut self) {
+        let text = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| {
+                t.text_buffer.lock().ok().map(|b| {
+                    let mut out = String::new();
+                    for i in 0..b.total_lines() {
+                        if let Some(line) = b.line(i) {
+                            out.push_str(line);
+                            out.push('\n');
+                        }
+                    }
+                    out
+                })
+            })
+            .unwrap_or_default();
+        let msg = self.copy_to_clipboard_msg(&text, "scrollback");
+        self.usage_lines = msg;
+        self.usage_open = true;
+    }
+
+    /// Copy the last assistant message from the active chat's jsonl into the
+    /// clipboard. Useful for "send me what claude just said".
+    fn copy_last_response(&mut self) {
+        let session = self.resolve_active_session();
+        let Some(s) = session else {
+            self.usage_lines = vec![" no resolved session for the active chat ".into()];
+            self.usage_open = true;
+            return;
+        };
+        let text = match last_assistant_text(&s.file_path) {
+            Ok(t) if !t.is_empty() => t,
+            Ok(_) => {
+                self.usage_lines = vec![" no assistant turn found in jsonl yet ".into()];
+                self.usage_open = true;
+                return;
+            }
+            Err(e) => {
+                self.usage_lines = vec![format!(" reading jsonl failed: {} ", e)];
+                self.usage_open = true;
+                return;
+            }
+        };
+        let msg = self.copy_to_clipboard_msg(&text, "last response");
+        self.usage_lines = msg;
+        self.usage_open = true;
+    }
+
+    /// Shared "copy and report" helper for the two clipboard actions above.
+    fn copy_to_clipboard_msg(&self, text: &str, label: &str) -> Vec<String> {
+        if text.is_empty() {
+            return vec![format!(" nothing to copy: {} is empty ", label)];
+        }
+        let chars = text.chars().count();
+        match clipboard::copy(text) {
+            Ok(backend) => vec![
+                format!(" Copied {} chars to clipboard ({}) ", chars, backend),
+                format!(" source: {} ", label),
+            ],
+            Err(e) => vec![format!(" Copy failed: {} ", e)],
+        }
     }
 
     /// Run `git diff` synchronously in the active tab's cwd, populate the
@@ -1883,6 +2023,26 @@ impl App {
             &mut items,
             "★  Show git diff for active chat's cwd",
             Action::ShowGitDiff,
+        );
+        push_action(
+            &mut items,
+            "★  Clear active chat (sends /clear · Ctrl+L)",
+            Action::ClearActiveChat,
+        );
+        push_action(
+            &mut items,
+            "★  Copy active chat's scrollback to clipboard",
+            Action::CopyChatScrollback,
+        );
+        push_action(
+            &mut items,
+            "★  Copy last claude response to clipboard",
+            Action::CopyLastResponse,
+        );
+        push_action(
+            &mut items,
+            "★  Reopen most recently closed chat (Ctrl+Shift+T)",
+            Action::ReopenLastClosed,
         );
         push_action(&mut items, "★  Close active tab", Action::CloseTab);
         push_action(&mut items, "★  Previous chat (in project)", Action::PrevTab);
@@ -2416,6 +2576,8 @@ struct CliArgs {
     resume: Option<String>,
     /// `--continue` — first tab spawns claude with `--continue`.
     continue_last: bool,
+    /// `--doctor` — print diagnostics and exit (no TUI).
+    doctor: bool,
 }
 
 fn parse_args() -> std::result::Result<CliArgs, String> {
@@ -2439,6 +2601,9 @@ fn parse_args() -> std::result::Result<CliArgs, String> {
             }
             "--continue" => {
                 out.continue_last = true;
+            }
+            "--doctor" => {
+                out.doctor = true;
             }
             s if s.starts_with("--") => return Err(format!("unknown flag: {}", s)),
             s => {
@@ -2469,10 +2634,47 @@ OPTIONS:
     --layout NAME       Apply a named layout from ~/.cmux/layouts/<NAME>.json
     --resume ID         Resume the given claude session id in the first tab
     --continue          Spawn the first tab with `claude --continue`
+    --doctor            Print diagnostics (paths, versions, config) and exit
     -h, --help          Print this help and exit
     -V, --version       Print version and exit",
         ver = env!("CARGO_PKG_VERSION"),
     );
+}
+
+/// Find the text content of the most recent `assistant` entry in a claude
+/// jsonl. Skips tool_use / system entries. Returns "" if none found.
+fn last_assistant_text(path: &Path) -> std::io::Result<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let rdr = std::io::BufReader::new(file);
+    let mut last: String = String::new();
+    for line in rdr.lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let content = v.get("message").and_then(|m| m.get("content"));
+        let text = match content {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(|t| t.as_str()) != Some("text") {
+                        return None;
+                    }
+                    b.get("text").and_then(|t| t.as_str()).map(String::from)
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        if !text.trim().is_empty() {
+            last = text;
+        }
+    }
+    Ok(last)
 }
 
 /// Scan a chunk of PTY bytes for an OSC 7 cwd hint
@@ -2648,6 +2850,12 @@ fn action_from_str(s: &str) -> Option<Action> {
         "open_broadcast" | "broadcast" => Action::OpenBroadcast,
         "reload_config" | "reload" => Action::ReloadConfig,
         "quit" => Action::Quit,
+        "clear_active_chat" | "clear_chat" | "clear" => Action::ClearActiveChat,
+        "copy_chat_scrollback" | "copy_scrollback" => Action::CopyChatScrollback,
+        "copy_last_response" | "copy_response" => Action::CopyLastResponse,
+        "show_active_usage" | "usage" => Action::ShowActiveUsage,
+        "show_git_diff" | "git_diff" | "diff" => Action::ShowGitDiff,
+        "reopen_last_closed" | "reopen" => Action::ReopenLastClosed,
         _ => return None,
     })
 }
@@ -2773,6 +2981,104 @@ fn open_url_inner(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Print a diagnostics dump (config, layouts, claude binary, terminal env)
+/// and exit. Intended as the answer when a user files an issue: paste this
+/// output. Doesn't enter raw mode and doesn't touch any files.
+fn print_doctor() {
+    println!("cmux {} — diagnostics", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("[platform]");
+    println!("  os                  = {}", std::env::consts::OS);
+    println!("  family              = {}", std::env::consts::FAMILY);
+    println!("  arch                = {}", std::env::consts::ARCH);
+    if let Ok(term) = std::env::var("TERM") {
+        println!("  TERM                = {}", term);
+    }
+    if let Ok(t) = std::env::var("WT_SESSION") {
+        println!("  WT_SESSION          = {} (Windows Terminal)", t);
+    }
+    if let Ok(t) = std::env::var("TERM_PROGRAM") {
+        println!("  TERM_PROGRAM        = {}", t);
+    }
+
+    println!();
+    println!("[claude]");
+    let exe = if cfg!(windows) { "claude.cmd" } else { "claude" };
+    match find_claude_on_path() {
+        Some(p) => {
+            println!("  binary on PATH      = {}", p.display());
+            let ver = std::process::Command::new(&p)
+                .arg("--version")
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    } else {
+                        None
+                    }
+                });
+            println!("  --version           = {}", ver.unwrap_or_else(|| "(no output)".into()));
+        }
+        None => {
+            println!("  binary on PATH      = NOT FOUND ({})", exe);
+        }
+    }
+    println!("  ~/.claude/projects  = {}", sessions::claude_projects_root().display());
+    let sess_count = std::fs::read_dir(sessions::claude_projects_root())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    println!("  project dirs        = {}", sess_count);
+
+    println!();
+    println!("[cmux paths]");
+    let cfg = config::config_path();
+    println!("  config              = {} {}", cfg.display(), exists_tag(&cfg));
+    let layout = layout::layout_path();
+    println!("  auto-layout         = {} {}", layout.display(), exists_tag(&layout));
+    let layouts_dir = layout::layouts_dir();
+    println!("  named layouts dir   = {} {}", layouts_dir.display(), exists_tag(&layouts_dir));
+    let names = layout::list_named();
+    if !names.is_empty() {
+        println!("  named layouts       = {}", names.join(", "));
+    }
+
+    println!();
+    println!("[config snapshot]");
+    let c = config::load();
+    println!("  layout.auto_restore       = {}", c.layout.auto_restore);
+    println!("  layout.scrollback_lines   = {}", c.layout.scrollback_lines);
+    println!("  shell.follow_tab_cwd      = {}", c.shell.follow_tab_cwd);
+    println!("  notify.bell               = {}", c.notify.bell);
+    println!("  notify.toast              = {}", c.notify.toast);
+    println!("  detect.permission_patterns = {} patterns", c.detect.permission_patterns.len());
+    println!("  theme.accent              = {}", c.theme.accent);
+    println!("  keys (overrides)          = {}", c.keys.len());
+}
+
+/// Helper: returns "(exists)" / "(missing)" suffix.
+fn exists_tag(p: &Path) -> &'static str {
+    if p.exists() {
+        "(exists)"
+    } else {
+        "(missing)"
+    }
+}
+
+/// Locate `claude` (or `claude.cmd` on Windows) on PATH. Used by both the
+/// pre-flight check and `--doctor`.
+fn find_claude_on_path() -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "claude.cmd" } else { "claude" };
+    let path = std::env::var("PATH").ok()?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(exe);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Make sure `claude` (or `claude.cmd` on Windows) is somewhere on PATH so we
 /// can give a clear pre-raw-mode error instead of a cryptic PTY failure later.
 fn claude_on_path() -> bool {
@@ -2800,6 +3106,11 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+
+    if args.doctor {
+        print_doctor();
+        std::process::exit(0);
+    }
 
     if !claude_on_path() {
         let exe = if cfg!(windows) { "claude.cmd" } else { "claude" };
@@ -2953,7 +3264,9 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
         // unread-replies badge on Streaming → Idle for non-active tabs.
         let bell = app.config.notify.bell;
         let toast = app.config.notify.toast;
+        let osc = app.config.notify.osc;
         let mut fired_bell = false;
+        let mut fired_osc = false;
         let active_idx = app.active;
         for (i, &state) in states.iter().enumerate() {
             let prev = app.last_states.get(i).copied().unwrap_or(TabState::Idle);
@@ -2970,6 +3283,13 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                     if bell && !fired_bell {
                         notify::bell();
                         fired_bell = true; // one bell per cycle, even if several tabs flip
+                    }
+                    if osc && !fired_osc {
+                        notify::osc_notify(
+                            &format!("cmux: {} needs you", tab.title),
+                            "claude is waiting on a permission prompt",
+                        );
+                        fired_osc = true;
                     }
                     if toast {
                         notify::toast(
@@ -5139,6 +5459,8 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("Ctrl+B",        "Files sidebar (chroot to tab cwd)"),
         ("Ctrl+`",        "Bottom shell pane (parent shell)"),
         ("Ctrl+F",        "Search active tab's scrollback"),
+        ("Ctrl+L",        "Send /clear to active chat"),
+        ("Ctrl+Shift+T",  "Reopen most recently closed chat"),
         ("Shift+F2",      "Rename active tab"),
         ("Drag tab",      "Reorder tabs (mouse down on one, up on another)"),
         ("Double-click",  "Close that chat (pinned → ask confirmation)"),
@@ -5842,6 +6164,29 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.show_git_diff();
             Ok(KeyOutcome::LayoutChanged)
         }
+        Action::ClearActiveChat => {
+            app.active_tab().write_input(b"/clear\r")?;
+            Ok(KeyOutcome::Continue)
+        }
+        Action::CopyChatScrollback => {
+            app.copy_scrollback();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::CopyLastResponse => {
+            app.copy_last_response();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::ReopenLastClosed => {
+            let reopened = app.reopen_last_closed(
+                pty_area.height.max(1),
+                pty_area.width.max(1),
+            )?;
+            if reopened {
+                app.on_active_changed();
+                app.save_layout();
+            }
+            Ok(KeyOutcome::LayoutChanged)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -5978,6 +6323,12 @@ fn handle_key(
     // Ctrl+F — toggle scrollback search on the active tab (global).
     if ctrl && matches!(k.code, KeyCode::Char('f') | KeyCode::Char('F')) {
         return execute_action(Action::ToggleSearch, app, pty_area);
+    }
+
+    // Ctrl+L — send `/clear` to the active chat. claude itself handles
+    // the command; we're just a single-stroke shortcut for typing it.
+    if ctrl && matches!(k.code, KeyCode::Char('l') | KeyCode::Char('L')) {
+        return execute_action(Action::ClearActiveChat, app, pty_area);
     }
 
     // While search overlay is open, swallow keys.
@@ -6139,6 +6490,10 @@ fn handle_key(
             if c.is_ascii_digit() && c != '0' {
                 let idx = (c as u8 - b'1') as usize;
                 return execute_action(Action::SwitchProject(idx), app, pty_area);
+            }
+            // Ctrl+Shift+T — reopen the most recently closed chat.
+            if matches!(c, 't' | 'T') {
+                return execute_action(Action::ReopenLastClosed, app, pty_area);
             }
         }
     }

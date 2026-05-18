@@ -8,6 +8,29 @@ pub fn bell() {
     let _ = out.flush();
 }
 
+/// Emit OSC 9 (iTerm2 / Windows Terminal) and OSC 777 (Konsole / KDE)
+/// notification sequences. These are completely ignored by terminals that
+/// don't recognise them, so it's safe to send both unconditionally.
+/// `title` and `body` must not contain BEL (`\x07`) or ESC (`\x1b`); we
+/// sanitise just in case.
+pub fn osc_notify(title: &str, body: &str) {
+    let title = sanitise(title);
+    let body = sanitise(body);
+    let mut out = std::io::stdout();
+    // OSC 9 — iTerm2 form: `ESC ] 9 ; <text> BEL`
+    let _ = write!(out, "\x1b]9;{}: {}\x07", title, body);
+    // OSC 777 — Konsole / "Konsole notify" form:
+    //   `ESC ] 777 ; notify ; <title> ; <message> BEL`
+    let _ = write!(out, "\x1b]777;notify;{};{}\x07", title, body);
+    let _ = out.flush();
+}
+
+fn sanitise(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '\x07' && *c != '\x1b' && *c != ';')
+        .collect()
+}
+
 /// Show a Windows toast notification. No-op on non-Windows platforms.
 /// Fire-and-forget — errors are swallowed because failing to notify must
 /// never disrupt the TUI.
