@@ -19,8 +19,8 @@ use std::{
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -1099,7 +1099,12 @@ fn main() -> Result<()> {
     config::ensure_default_written();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1118,7 +1123,8 @@ fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
     result
@@ -1387,6 +1393,23 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                     terminal.clear()?;
                     needs_draw = true;
                     applied_pty_size = None;
+                }
+                Event::Paste(s) => {
+                    // Forward as bracketed paste so the inner program treats it
+                    // as a single chunk (no premature Enter on newlines).
+                    let mut bytes = Vec::with_capacity(s.len() + 12);
+                    bytes.extend_from_slice(b"\x1b[200~");
+                    bytes.extend_from_slice(s.as_bytes());
+                    bytes.extend_from_slice(b"\x1b[201~");
+                    if app.bottom_open && app.bottom_focused {
+                        if let Some(bt) = app.bottom.as_mut() {
+                            bt.write_input(&bytes)?;
+                        }
+                    } else {
+                        app.active_tab().scroll_reset();
+                        app.active_tab().write_input(&bytes)?;
+                    }
+                    needs_draw = true;
                 }
                 _ => {}
             }
