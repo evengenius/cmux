@@ -3460,19 +3460,20 @@ fn render_button_bar(
     // (label, action, is_active). F9 is its own slot — uses a sentinel action
     // we map below since we don't want a "TogglePalette" Action variant.
     let buttons: Vec<(&'static str, Action, bool)> = vec![
-        (" F2 new ", Action::NewTab, false),
         (" F1 help ", Action::ToggleHelp, app.help_open),
+        (" F2 new ", Action::NewTab, false),
         (" F3 sessions ", Action::ToggleSidebar, app.sidebar_open && app.sidebar_mode == SidebarMode::Sessions),
         (" F4 cmds ", Action::ToggleCommands, app.sidebar_open && app.sidebar_mode == SidebarMode::Commands),
-        (" ^B files ", Action::ToggleFilesSidebar, app.right_sidebar_open),
         (" F5 deep ", Action::ToggleDeepGrep, app.deep_grep),
         (" F6 explorer ", Action::ToggleBrowser, app.browser_open),
-        (" ^` term ", Action::ToggleBottom, app.bottom_open),
         (" F7 mouse ", Action::ToggleMouse, !app.mouse_on),
         (" F8 close ", Action::CloseTab, false),
         (" F9 cmd ", Action::TogglePalette, app.palette_open),
         (" F11 < ", Action::PrevTab, false),
         (" F12 > ", Action::NextTab, false),
+        (" ^B files ", Action::ToggleFilesSidebar, app.right_sidebar_open),
+        (" ^` term ", Action::ToggleBottom, app.bottom_open),
+        (" ^F search ", Action::ToggleSearch, app.search.open),
         (" quit ", Action::Quit, false),
     ];
 
