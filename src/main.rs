@@ -53,6 +53,10 @@ use sessions::SessionMeta;
 ///   row last — button bar
 const CHROME_ROWS: u16 = 3;
 const SCROLLBACK_LINES: usize = 10_000;
+/// Short model names shown in the palette for "New tab with model: …".
+/// Claude Code CLI's `--model` accepts these; if the user runs an unsupported
+/// model on their plan claude itself will complain.
+const NEW_TAB_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
 /// Max gap between two left-button-down events on the same chat that still
 /// counts as a double-click (close-the-tab gesture).
 const DOUBLE_CLICK_MS: u128 = 500;
@@ -93,6 +97,12 @@ enum Action {
     ToggleActiveProjectPin,
     /// Spawn a new tab in the active project's cwd with `claude --continue`.
     NewTabContinue,
+    /// Spawn a new tab passing `--model <name>` to claude. usize indexes
+    /// into `NEW_TAB_MODELS`.
+    NewTabWithModel(usize),
+    /// Open the broadcast modal — Enter sends the typed prompt to every
+    /// chat in the active project.
+    OpenBroadcast,
     ReloadConfig,
     Quit,
 }
@@ -187,6 +197,24 @@ enum PaletteResult {
     OpenSession(usize),
     SwitchLayout(usize),
     DeleteLayout(usize),
+}
+
+// ===========================================================================
+// Broadcast modal — type once, submit to every chat in the active project.
+// ===========================================================================
+#[derive(Default)]
+struct BroadcastState {
+    open: bool,
+    /// Text the user is typing. Submit appends `\r` per recipient so claude
+    /// treats it as one submitted prompt.
+    input: String,
+}
+
+impl BroadcastState {
+    fn clear(&mut self) {
+        self.open = false;
+        self.input.clear();
+    }
 }
 
 // ===========================================================================
@@ -708,6 +736,10 @@ struct App {
     sidebar_idx: usize,
     sidebar_scroll: usize,
     filter: String,
+    /// Per-mode filter memos — preserved across F3↔F4 switches and close/open
+    /// cycles, so re-entering a sidebar lands you back on the same query.
+    sessions_filter_memo: String,
+    commands_filter_memo: String,
     filtered: Vec<usize>,
     deep_grep: bool,
     grep_job: Option<GrepJob>,
@@ -764,6 +796,8 @@ struct App {
     save_as_error: Option<String>,
     // confirm modal for destructive actions
     confirm: ConfirmState,
+    // broadcast modal — send one prompt to every chat in active project
+    broadcast: BroadcastState,
     // named layouts in ~/.cmux/layouts/, refreshed on palette open
     layout_names: Vec<String>,
     // persisted layout (if any was found at startup)
@@ -794,6 +828,8 @@ impl App {
             sidebar_idx: 0,
             sidebar_scroll: 0,
             filter: String::new(),
+            sessions_filter_memo: String::new(),
+            commands_filter_memo: String::new(),
             filtered: Vec::new(),
             deep_grep: false,
             grep_job: None,
@@ -832,6 +868,7 @@ impl App {
             save_as_input: String::new(),
             save_as_error: None,
             confirm: ConfirmState::default(),
+            broadcast: BroadcastState::default(),
             layout_names: Vec::new(),
             saved_layout: layout::load(),
             config,
@@ -1025,7 +1062,7 @@ impl App {
             self.sidebar_focused = false;
             return;
         }
-        self.sidebar_mode = SidebarMode::Sessions;
+        self.swap_filter_for_mode(SidebarMode::Sessions);
         // Always re-enumerate on open so new/closed sessions show up. The
         // scan is cheap (<50ms for hundreds of files) and beats the surprise
         // of "I started another tab two hours ago and it isn't here".
@@ -1035,6 +1072,25 @@ impl App {
         self.sidebar_idx = 0;
         self.sidebar_scroll = 0;
         self.apply_filter();
+    }
+
+    /// Stash the current `filter` into the previous mode's memo and restore
+    /// the new mode's memo. Lets the user re-enter F3 / F4 with the query
+    /// they had last time.
+    fn swap_filter_for_mode(&mut self, new_mode: SidebarMode) {
+        match self.sidebar_mode {
+            SidebarMode::Sessions => {
+                self.sessions_filter_memo = std::mem::take(&mut self.filter);
+            }
+            SidebarMode::Commands => {
+                self.commands_filter_memo = std::mem::take(&mut self.filter);
+            }
+        }
+        self.filter = match new_mode {
+            SidebarMode::Sessions => std::mem::take(&mut self.sessions_filter_memo),
+            SidebarMode::Commands => std::mem::take(&mut self.commands_filter_memo),
+        };
+        self.sidebar_mode = new_mode;
     }
 
     /// Re-scan `~/.claude/projects/` and replace `self.sessions`. Used by F3
@@ -1050,12 +1106,11 @@ impl App {
             self.sidebar_focused = false;
             return;
         }
-        self.sidebar_mode = SidebarMode::Commands;
+        self.swap_filter_for_mode(SidebarMode::Commands);
         self.sidebar_open = true;
         self.sidebar_focused = true;
         self.sidebar_idx = 0;
         self.sidebar_scroll = 0;
-        self.filter.clear();
         self.reload_commands();
         self.apply_commands_filter();
     }
@@ -1331,6 +1386,29 @@ impl App {
         self.confirm.message = message;
         self.confirm.pending = Some(pending);
         self.confirm.open = true;
+    }
+
+    /// Send `self.broadcast.input` (with a trailing `\r` so claude submits it)
+    /// to every chat sharing the active project's cwd. Errors per chat are
+    /// swallowed — one stuck PTY shouldn't abort the whole broadcast.
+    fn apply_broadcast(&mut self) -> usize {
+        let text = self.broadcast.input.trim().to_string();
+        if text.is_empty() {
+            return 0;
+        }
+        let cwd = self.active_project_cwd();
+        let mut payload = text.into_bytes();
+        payload.push(b'\r');
+        let mut sent = 0;
+        for t in self.tabs.iter_mut() {
+            if t.cwd != cwd {
+                continue;
+            }
+            if t.write_input(&payload).is_ok() {
+                sent += 1;
+            }
+        }
+        sent
     }
 
     /// Execute the pending action committed via Y/Enter in the confirm modal.
@@ -1616,6 +1694,19 @@ impl App {
             "★  New tab continuing last session (claude --continue)",
             Action::NewTabContinue,
         );
+        for (i, model) in NEW_TAB_MODELS.iter().enumerate() {
+            let label = format!("★  New tab with model: {}", model);
+            items.push(PaletteItem {
+                label: label.clone(),
+                hay: label.to_lowercase(),
+                kind: PaletteKind::Action(Action::NewTabWithModel(i)),
+            });
+        }
+        push_action(
+            &mut items,
+            "★  Broadcast prompt to all chats in active project…",
+            Action::OpenBroadcast,
+        );
         push_action(&mut items, "★  Close active tab", Action::CloseTab);
         push_action(&mut items, "★  Previous chat (in project)", Action::PrevTab);
         push_action(&mut items, "★  Next chat (in project)", Action::NextTab);
@@ -1817,6 +1908,39 @@ impl App {
     fn spawn_tab_here(&mut self, cwd: PathBuf, rows: u16, cols: u16) -> Result<()> {
         let scrollback = self.config.layout.scrollback_lines;
         let tab = ChatTab::spawn(cwd, rows, cols, scrollback)?;
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        Ok(())
+    }
+
+    /// Spawn a fresh tab in the active project's cwd asking claude to use
+    /// the model at `NEW_TAB_MODELS[idx]` via `--model <name>`. Title shows
+    /// the model so it's obvious in the chat bar.
+    fn open_tab_with_model_idx(&mut self, idx: usize, rows: u16, cols: u16) -> Result<()> {
+        let Some(&model) = NEW_TAB_MODELS.get(idx) else {
+            return Ok(());
+        };
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        let scrollback = self.config.layout.scrollback_lines;
+        let basename = cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("claude")
+            .to_string();
+        let title = format!("{} · {}", basename, model);
+        let tab = ChatTab::spawn_inner(
+            cwd,
+            &["--model", model],
+            title,
+            None,
+            rows,
+            cols,
+            scrollback,
+        )?;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -2161,6 +2285,96 @@ OPTIONS:
     -V, --version       Print version and exit",
         ver = env!("CARGO_PKG_VERSION"),
     );
+}
+
+/// URL regex used by Ctrl+Click detection. Lazy-compiled because building it
+/// every click would be silly. Tuned so trailing sentence punctuation (`.,;:!?`)
+/// stays outside the match while internal punctuation is fine.
+fn url_regex() -> &'static regex::Regex {
+    static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b(?:https?|file)://[-a-zA-Z0-9+&@#/%?=~_|!:,.;()*]*[-a-zA-Z0-9+&@#/%=~_|()]",
+        )
+        .expect("url regex compiles")
+    })
+}
+
+/// If a URL covers `(row, col)` on the current vt100 screen, return it.
+fn url_at(screen: &vt100::Screen, row: u16, col: u16) -> Option<String> {
+    let (rows, cols) = screen.size();
+    if row >= rows {
+        return None;
+    }
+    let mut row_cells: Vec<String> = Vec::with_capacity(cols as usize);
+    for c in 0..cols {
+        let s = screen
+            .cell(row, c)
+            .map(|c| c.contents().to_string())
+            .unwrap_or_default();
+        row_cells.push(if s.is_empty() { " ".into() } else { s });
+    }
+    let row_text: String = row_cells.concat();
+    let mut byte_to_col: Vec<u16> = Vec::with_capacity(row_text.len() + 1);
+    for (cc, s) in row_cells.iter().enumerate() {
+        for _ in 0..s.len() {
+            byte_to_col.push(cc as u16);
+        }
+    }
+    byte_to_col.push(cols);
+    for m in url_regex().find_iter(&row_text) {
+        let col_start = byte_to_col.get(m.start()).copied().unwrap_or(0);
+        let col_end = byte_to_col.get(m.end()).copied().unwrap_or(cols);
+        if col >= col_start && col < col_end {
+            return Some(m.as_str().to_string());
+        }
+    }
+    None
+}
+
+/// Open `url` in the OS default handler. Fire-and-forget — errors are
+/// swallowed because failing to open a URL should never tear down the TUI.
+fn open_url(url: &str) {
+    let _ = open_url_inner(url);
+}
+
+#[cfg(windows)]
+fn open_url_inner(url: &str) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // `cmd /c start "" "<url>"` — the empty quoted string is the window title;
+    // start treats the first quoted argument as the title, so we need a
+    // placeholder so the actual URL is parsed as the file to open.
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_url_inner(url: &str) -> Result<()> {
+    std::process::Command::new("open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn open_url_inner(url: &str) -> Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 /// Make sure `claude` (or `claude.cmd` on Windows) is somewhere on PATH so we
@@ -2651,6 +2865,9 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 if app.confirm.open {
                     render_confirm_modal(f, f.area(), app);
                 }
+                if app.broadcast.open {
+                    render_broadcast_modal(f, f.area(), app);
+                }
             })?;
             needs_draw = false;
         }
@@ -3001,6 +3218,33 @@ fn handle_global_sessions_key(
         KeyCode::Char(c) if !ctrl && !alt => {
             app.global_sessions.filter.push(c);
             app.rebuild_global_entries();
+        }
+        _ => {}
+    }
+    Ok(KeyOutcome::Continue)
+}
+
+// ===========================================================================
+// Broadcast modal key handler — Enter blasts the prompt to every chat in
+// the active project, Esc cancels.
+// ===========================================================================
+fn handle_broadcast_key(k: crossterm::event::KeyEvent, app: &mut App) -> Result<KeyOutcome> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    match k.code {
+        KeyCode::Esc => {
+            app.broadcast.clear();
+            return Ok(KeyOutcome::LayoutChanged);
+        }
+        KeyCode::Enter => {
+            let _ = app.apply_broadcast();
+            app.broadcast.clear();
+            return Ok(KeyOutcome::LayoutChanged);
+        }
+        KeyCode::Backspace if app.broadcast.input.pop().is_some() => {}
+        KeyCode::Char('u') if ctrl => app.broadcast.input.clear(),
+        KeyCode::Char(c) if !ctrl && !alt => {
+            app.broadcast.input.push(c);
         }
         _ => {}
     }
@@ -3642,6 +3886,82 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
         }
     }
     f.render_widget(Paragraph::new(lines), list_area);
+}
+
+// ===========================================================================
+// Broadcast modal — centered prompt; Enter sends to every chat in project.
+// ===========================================================================
+fn render_broadcast_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
+    let w = 76u16.min(full_area.width.saturating_sub(4));
+    let h = 6u16;
+    if w < 30 || full_area.height < h + 2 {
+        return;
+    }
+    let x = full_area.x + (full_area.width.saturating_sub(w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+
+    let target_count = {
+        let cwd = app.active_project_cwd();
+        app.tabs.iter().filter(|t| t.cwd == cwd).count()
+    };
+
+    let block = Block::default()
+        .title(format!(
+            " Broadcast prompt → {} chat(s) in active project · Enter send · Esc cancel ",
+            target_count
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .style(Style::default().bg(Color::Rgb(20, 18, 28)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    let basename = app
+        .active_project_cwd()
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" project: {} ", basename),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[0],
+    );
+
+    let max_visible = (chunks[1].width as usize).saturating_sub(4);
+    let display = if app.broadcast.input.chars().count() > max_visible {
+        let skip = app.broadcast.input.chars().count() - max_visible;
+        app.broadcast.input.chars().skip(skip).collect::<String>()
+    } else {
+        app.broadcast.input.clone()
+    };
+    let input = Line::from(vec![
+        Span::styled(" ▶ ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(display, Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(input).style(Style::default().bg(Color::Rgb(28, 28, 36))),
+        chunks[1],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Ctrl+U clears · empty input = no-op ",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[2],
+    );
 }
 
 // ===========================================================================
@@ -4294,6 +4614,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("Drag tab",      "Reorder tabs (mouse down on one, up on another)"),
         ("Double-click",  "Close that chat (pinned → ask confirmation)"),
         ("Right-click",   "Rename that chat (opens the rename modal)"),
+        ("Ctrl+Click URL","Open the URL under the cursor in your browser"),
         ("2× project",    "Close entire project (asks confirmation)"),
         ("Pin via F9",    "Pinned tabs refuse to close (📌 prefix)"),
         ("Ctrl+Q",        "Quit"),
@@ -4963,6 +5284,21 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.save_layout();
             Ok(KeyOutcome::LayoutChanged)
         }
+        Action::NewTabWithModel(idx) => {
+            app.open_tab_with_model_idx(
+                idx,
+                pty_area.height.max(1),
+                pty_area.width.max(1),
+            )?;
+            app.on_active_changed();
+            app.save_layout();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::OpenBroadcast => {
+            app.broadcast.input.clear();
+            app.broadcast.open = true;
+            Ok(KeyOutcome::LayoutChanged)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -5015,6 +5351,11 @@ fn handle_key(
     // Confirm modal — top priority once visible.
     if app.confirm.open {
         return handle_confirm_key(k, app);
+    }
+
+    // Broadcast modal — eats keys until Enter/Esc.
+    if app.broadcast.open {
+        return handle_broadcast_key(k, app);
     }
 
     // Shift+F3 toggles the global-sessions modal.
@@ -5645,6 +5986,24 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
     if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
         app.sidebar_focused = false;
         app.right_sidebar_focused = false;
+    }
+
+    // Ctrl + left-click → look for a URL under the cursor and open it in the
+    // OS default handler. Resolved BEFORE forwarding to claude so the click
+    // doesn't double-trigger inside the inner TUI.
+    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left))
+        && me.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        let row_in_pty = me.row.saturating_sub(pty_area.y);
+        let col_in_pty = me.column.saturating_sub(pty_area.x);
+        let url = {
+            let p = app.active_tab().parser.lock().unwrap();
+            url_at(p.screen(), row_in_pty, col_in_pty)
+        };
+        if let Some(u) = url {
+            open_url(&u);
+            return Ok(None);
+        }
     }
 
     let mouse_enabled = app.active_tab().mouse_enabled();
