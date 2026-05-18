@@ -15,7 +15,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -269,6 +269,11 @@ struct ChatTab {
     /// Plain-text mirror of the PTY output, fed alongside the vt100 parser.
     /// Used by the Ctrl+F scrollback search.
     text_buffer: Arc<Mutex<ScrollbackText>>,
+    /// Newlines seen on this tab's PTY since the user last focused it. The
+    /// reader thread increments this; `on_active_changed` resets the newly
+    /// active tab's counter to zero. Rendered in the tab bar as a `[N]` badge
+    /// on non-active tabs with unread > 0.
+    unread_lines: Arc<AtomicUsize>,
     /// True while the tab has already fired its AwaitingPermission notification
     /// for the current "stuck" period. Cleared once state leaves Awaiting so
     /// the next transition fires again.
@@ -340,12 +345,14 @@ impl ChatTab {
         let dirty = Arc::new(AtomicBool::new(true));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let text_buffer = Arc::new(Mutex::new(ScrollbackText::new()));
+        let unread_lines = Arc::new(AtomicUsize::new(0));
 
         let mut reader = pair.master.try_clone_reader()?;
         let parser_for_reader = parser.clone();
         let dirty_for_reader = dirty.clone();
         let activity_for_reader = last_activity.clone();
         let text_for_reader = text_buffer.clone();
+        let unread_for_reader = unread_lines.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -357,6 +364,10 @@ impl ChatTab {
                         }
                         if let Ok(mut t) = text_for_reader.lock() {
                             t.feed(&buf[..n]);
+                        }
+                        let nls = buf[..n].iter().filter(|&&b| b == b'\n').count();
+                        if nls > 0 {
+                            unread_for_reader.fetch_add(nls, Ordering::Relaxed);
                         }
                         dirty_for_reader.store(true, Ordering::Release);
                         if let Ok(mut t) = activity_for_reader.lock() {
@@ -382,6 +393,7 @@ impl ChatTab {
             writer,
             child,
             text_buffer,
+            unread_lines,
             notified_awaiting: false,
         })
     }
@@ -899,6 +911,10 @@ impl App {
     fn on_active_changed(&mut self) {
         if self.right_sidebar_open {
             self.ensure_browser_for_active_tab();
+        }
+        // User has eyes on this tab — clear its unread badge.
+        if let Some(tab) = self.tabs.get(self.active) {
+            tab.unread_lines.store(0, Ordering::Relaxed);
         }
         self.follow_bottom_to_active();
         // Search is scoped to a single tab — close it on switch so the user
@@ -1679,8 +1695,13 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
             app.mouse_capture_dirty = false;
         }
 
-        if app.active_tab().dirty.swap(false, Ordering::Acquire) {
-            needs_draw = true;
+        // Any tab with new output triggers a redraw — the active tab so its
+        // PTY view is current, background tabs so their unread badges and
+        // state dots are up to date in the tab bar.
+        for t in app.tabs.iter() {
+            if t.dirty.swap(false, Ordering::Acquire) {
+                needs_draw = true;
+            }
         }
 
         if let Some(bt) = app.bottom.as_ref() {
@@ -2012,10 +2033,26 @@ fn render_tab_bar(
             ),
         };
 
+        // Show an unread badge only on tabs the user isn't currently on —
+        // the active tab is being looked at, by definition not "unread".
+        let unread = if i == active {
+            0
+        } else {
+            t.unread_lines.load(Ordering::Relaxed)
+        };
+        let badge = if unread == 0 {
+            None
+        } else if unread > 999 {
+            Some(" [999+] ".to_string())
+        } else {
+            Some(format!(" [{}] ", unread))
+        };
+
         let label = format!(" {}: {} ", i + 1, t.title);
         let label_w = label.chars().count() as u16;
         let dot_w = dot.map(|s| s.chars().count() as u16).unwrap_or(0);
-        let total_w = label_w + dot_w;
+        let badge_w = badge.as_ref().map(|s| s.chars().count() as u16).unwrap_or(0);
+        let total_w = label_w + dot_w + badge_w;
 
         let label_style = if i == active {
             Style::default()
@@ -2028,6 +2065,16 @@ fn render_tab_bar(
         let label_bg = if i == active { Color::White } else { Color::DarkGray };
 
         spans.push(Span::styled(label, label_style));
+        if let Some(b) = badge {
+            // Badge stays on the tab's background so the click rect is contiguous.
+            spans.push(Span::styled(
+                b,
+                Style::default()
+                    .bg(label_bg)
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if let (Some(d), Some(ds)) = (dot, dot_style) {
             // keep the dot's cell on the tab's background so it reads as part of the tab
             spans.push(Span::styled(d, ds.bg(label_bg)));
