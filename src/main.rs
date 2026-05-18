@@ -804,6 +804,8 @@ struct App {
     saved_layout: Option<layout::SavedLayout>,
     // user config
     config: config::Config,
+    // user-defined keymap from `[keys]` section, rebuilt on reload.
+    key_bindings: KeyBindings,
 }
 
 impl App {
@@ -871,6 +873,7 @@ impl App {
             broadcast: BroadcastState::default(),
             layout_names: Vec::new(),
             saved_layout: layout::load(),
+            key_bindings: KeyBindings::from_config(&config.keys),
             config,
         })
     }
@@ -1188,9 +1191,16 @@ impl App {
 
     fn reload_config(&mut self) {
         self.config = config::load();
+        self.key_bindings = KeyBindings::from_config(&self.config.keys);
         if let Some(b) = self.browser.as_mut() {
             b.set_show_hidden(self.config.browser.show_hidden);
         }
+    }
+
+    /// Accent colour resolved from config; cached lookups are cheap, no need
+    /// to memoise.
+    fn accent_color(&self) -> Color {
+        parse_accent(&self.config.theme.accent)
     }
 
     /// Call after any change that may have shifted the active tab.
@@ -2285,6 +2295,145 @@ OPTIONS:
     -V, --version       Print version and exit",
         ver = env!("CARGO_PKG_VERSION"),
     );
+}
+
+/// Parse a config-supplied accent colour name into a ratatui Color. Unknown
+/// values fall back to cyan so a typo doesn't crash the TUI.
+fn parse_accent(name: &str) -> Color {
+    match name.trim().to_lowercase().as_str() {
+        "cyan" => Color::Cyan,
+        "yellow" => Color::Yellow,
+        "green" => Color::Green,
+        "magenta" => Color::Magenta,
+        "red" => Color::Red,
+        "blue" => Color::Blue,
+        "white" => Color::White,
+        "gray" | "grey" => Color::Gray,
+        "lightblue" => Color::LightBlue,
+        "lightgreen" => Color::LightGreen,
+        "lightmagenta" => Color::LightMagenta,
+        "lightred" => Color::LightRed,
+        "lightyellow" => Color::LightYellow,
+        "lightcyan" => Color::LightCyan,
+        _ => Color::Cyan,
+    }
+}
+
+/// Parse a key-combo string like `"f4"`, `"ctrl-x"`, `"alt-shift-f12"` into
+/// a (KeyCode, KeyModifiers) pair. Returns None for unknown forms — caller
+/// drops the entry silently.
+fn parse_key_combo(s: &str) -> Option<(KeyCode, KeyModifiers)> {
+    let mut mods = KeyModifiers::empty();
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let (mod_parts, key_part) = parts.split_at(parts.len() - 1);
+    for m in mod_parts {
+        match m.to_lowercase().as_str() {
+            "ctrl" | "control" => mods |= KeyModifiers::CONTROL,
+            "alt" | "meta" => mods |= KeyModifiers::ALT,
+            "shift" => mods |= KeyModifiers::SHIFT,
+            _ => return None,
+        }
+    }
+    let key = key_part[0].to_lowercase();
+    let code = if let Some(rest) = key.strip_prefix('f') {
+        let n: u8 = rest.parse().ok()?;
+        if !(1..=12).contains(&n) {
+            return None;
+        }
+        KeyCode::F(n)
+    } else if key.chars().count() == 1 {
+        KeyCode::Char(key.chars().next()?)
+    } else {
+        match key.as_str() {
+            "enter" | "return" => KeyCode::Enter,
+            "esc" | "escape" => KeyCode::Esc,
+            "backspace" => KeyCode::Backspace,
+            "space" => KeyCode::Char(' '),
+            "tab" => KeyCode::Tab,
+            "up" => KeyCode::Up,
+            "down" => KeyCode::Down,
+            "left" => KeyCode::Left,
+            "right" => KeyCode::Right,
+            "pageup" => KeyCode::PageUp,
+            "pagedown" => KeyCode::PageDown,
+            "home" => KeyCode::Home,
+            "end" => KeyCode::End,
+            "delete" | "del" => KeyCode::Delete,
+            _ => return None,
+        }
+    };
+    Some((code, mods))
+}
+
+/// Resolve a snake_case action name into an Action variant. Only nullary
+/// variants are settable from config — variants with payloads (SwitchTab(n),
+/// SwitchProject(n), NewTabWithModel(i)) stay keyed to their existing
+/// hardcoded triggers.
+fn action_from_str(s: &str) -> Option<Action> {
+    Some(match s.trim().to_lowercase().as_str() {
+        "new_tab" => Action::NewTab,
+        "close_tab" => Action::CloseTab,
+        "prev_tab" => Action::PrevTab,
+        "next_tab" => Action::NextTab,
+        "toggle_sidebar" | "sessions_sidebar" => Action::ToggleSidebar,
+        "toggle_files_sidebar" | "files_sidebar" => Action::ToggleFilesSidebar,
+        "toggle_deep_grep" | "deep_grep" => Action::ToggleDeepGrep,
+        "toggle_mouse" => Action::ToggleMouse,
+        "toggle_palette" | "palette" => Action::TogglePalette,
+        "toggle_browser" | "file_browser" => Action::ToggleBrowser,
+        "toggle_bottom" | "bottom_shell" => Action::ToggleBottom,
+        "toggle_commands" | "commands_sidebar" => Action::ToggleCommands,
+        "toggle_help" | "help" => Action::ToggleHelp,
+        "toggle_search" | "search" => Action::ToggleSearch,
+        "rename_active_tab" | "rename" => Action::RenameActiveTab,
+        "restore_layout" => Action::RestoreLayout,
+        "open_save_layout_as" | "save_layout_as" => Action::OpenSaveLayoutAs,
+        "toggle_global_sessions" | "global_sessions" => Action::ToggleGlobalSessions,
+        "toggle_active_pin" | "pin_chat" => Action::ToggleActivePin,
+        "prev_project" => Action::PrevProject,
+        "next_project" => Action::NextProject,
+        "open_browser_for_new_project" | "new_project" => Action::OpenBrowserForNewProject,
+        "toggle_active_project_pin" | "pin_project" => Action::ToggleActiveProjectPin,
+        "new_tab_continue" | "continue" => Action::NewTabContinue,
+        "open_broadcast" | "broadcast" => Action::OpenBroadcast,
+        "reload_config" | "reload" => Action::ReloadConfig,
+        "quit" => Action::Quit,
+        _ => return None,
+    })
+}
+
+/// User-defined key→action map, rebuilt from config on every reload.
+#[derive(Default)]
+struct KeyBindings {
+    /// Parallel arrays keep the API tiny — linear scan over ≤ a few dozen
+    /// entries is cheaper than a HashMap and avoids needing Hash on KeyCode
+    /// across crossterm versions.
+    bindings: Vec<((KeyCode, KeyModifiers), Action)>,
+}
+
+impl KeyBindings {
+    fn from_config(map: &std::collections::HashMap<String, String>) -> Self {
+        let mut bindings = Vec::new();
+        for (action_name, key_combo) in map {
+            let (Some(act), Some(key)) =
+                (action_from_str(action_name), parse_key_combo(key_combo))
+            else {
+                continue;
+            };
+            bindings.push((key, act));
+        }
+        Self { bindings }
+    }
+
+    fn lookup(&self, code: KeyCode, mods: KeyModifiers) -> Option<Action> {
+        self.bindings
+            .iter()
+            .find(|((c, m), _)| *c == code && *m == mods)
+            .map(|(_, a)| *a)
+    }
 }
 
 /// URL regex used by Ctrl+Click detection. Lazy-compiled because building it
@@ -4024,10 +4173,11 @@ fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
 
     f.render_widget(Clear, area);
 
+    let accent = app.accent_color();
     let block = Block::default()
         .title(" Save layout as  ·  Enter save · Esc cancel ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(accent))
         .style(Style::default().bg(Color::Rgb(20, 20, 24)));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -4454,10 +4604,11 @@ fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
 
     f.render_widget(Clear, area);
 
+    let accent = app.accent_color();
     let block = Block::default()
         .title(" Command palette  ·  Esc close ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(accent))
         .style(Style::default().bg(Color::Rgb(20, 20, 24)));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -5331,6 +5482,23 @@ fn handle_key(
             return Ok(KeyOutcome::LayoutChanged);
         }
         return Ok(KeyOutcome::Continue);
+    }
+
+    // User-defined keybindings from `[keys]` — checked before the hardcoded
+    // F-key dispatch so the user can re-route any nullary action to any key.
+    // Modal overlays still need their own gates (already handled below).
+    if !app.palette_open
+        && !app.browser_open
+        && !app.search.open
+        && !app.rename_open
+        && !app.save_as_open
+        && !app.confirm.open
+        && !app.broadcast.open
+        && !app.global_sessions.open
+    {
+        if let Some(act) = app.key_bindings.lookup(k.code, k.modifiers) {
+            return execute_action(act, app, pty_area);
+        }
     }
 
     // Shift+F2 — rename the active tab.

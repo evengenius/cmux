@@ -14,6 +14,32 @@ pub struct Config {
     pub detect: DetectConfig,
     #[serde(default)]
     pub notify: NotifyConfig,
+    #[serde(default)]
+    pub theme: ThemeConfig,
+    #[serde(default)]
+    pub keys: std::collections::HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ThemeConfig {
+    /// Accent colour name used for: active-project highlight, palette border,
+    /// search-counter background. One of: cyan, yellow, green, magenta, red,
+    /// blue, white, gray, lightblue, lightgreen, lightmagenta, lightred,
+    /// lightyellow, lightcyan. Unknown values fall back to cyan.
+    #[serde(default = "default_accent")]
+    pub accent: String,
+}
+
+fn default_accent() -> String {
+    "cyan".to_string()
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            accent: default_accent(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -215,6 +241,24 @@ bell = true
 # PowerShell + WinRT call — no extra dependencies. Silently no-op on
 # non-Windows.
 toast = true
+
+[theme]
+# Accent colour. Used for: active-project highlight on the project bar,
+# the palette / global-sessions modal border, etc. One of: cyan, yellow,
+# green, magenta, red, blue, white, gray, lightblue, lightgreen,
+# lightmagenta, lightred, lightyellow, lightcyan.
+accent = "cyan"
+
+[keys]
+# Remap actions to custom keys. Format: action_name = key_combo.
+# Action names are snake_case versions of the internal Action variants
+# (e.g. toggle_search, toggle_palette, new_tab, close_tab, quit, etc.).
+# Key combos: f1..f12, single chars, ctrl-x, alt-shift-f4, etc. Unknown
+# entries are silently ignored. Default bindings stay in place unless
+# you explicitly override.
+# Example:
+#   toggle_search = "f4"        # F4 opens search instead of F4=commands
+#   quit = "ctrl-x"             # Ctrl+X quits (in addition to F10/Ctrl+Q)
 "#;
 
 pub fn ensure_default_written() {
