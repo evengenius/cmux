@@ -13,12 +13,19 @@ use std::collections::VecDeque;
 
 pub const MAX_LINES: usize = 10_000;
 
-#[derive(Default)]
 pub struct ScrollbackText {
     /// Completed lines, oldest first.
     lines: VecDeque<String>,
     /// In-progress line — no trailing newline yet.
     current: String,
+    /// Cap on `lines.len()` — older entries are dropped past this.
+    max: usize,
+}
+
+impl Default for ScrollbackText {
+    fn default() -> Self {
+        Self::with_capacity(MAX_LINES)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,8 +37,13 @@ pub struct Match {
 }
 
 impl ScrollbackText {
-    pub fn new() -> Self {
-        Self::default()
+    /// Build with an explicit line cap. Used to honour `[layout].scrollback_lines`.
+    pub fn with_capacity(max: usize) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            current: String::new(),
+            max: max.max(1),
+        }
     }
 
     /// Feed PTY bytes. ANSI/control sequences are stripped before splitting
@@ -44,7 +56,7 @@ impl ScrollbackText {
                 '\n' => {
                     let line = std::mem::take(&mut self.current);
                     self.lines.push_back(line);
-                    while self.lines.len() > MAX_LINES {
+                    while self.lines.len() > self.max {
                         self.lines.pop_front();
                     }
                 }
@@ -166,7 +178,7 @@ mod tests {
 
     #[test]
     fn plain_text_splits_on_newline() {
-        let mut s = ScrollbackText::new();
+        let mut s = ScrollbackText::default();
         s.feed(b"hello\nworld\n");
         assert_eq!(s.lines.len(), 2);
         assert_eq!(s.lines[0], "hello");
@@ -176,28 +188,28 @@ mod tests {
 
     #[test]
     fn cr_clears_current_line() {
-        let mut s = ScrollbackText::new();
+        let mut s = ScrollbackText::default();
         s.feed(b"abc\rdef\n");
         assert_eq!(s.lines[0], "def");
     }
 
     #[test]
     fn ansi_csi_stripped() {
-        let mut s = ScrollbackText::new();
+        let mut s = ScrollbackText::default();
         s.feed(b"\x1b[31mred\x1b[0m text\n");
         assert_eq!(s.lines[0], "red text");
     }
 
     #[test]
     fn ansi_osc_stripped() {
-        let mut s = ScrollbackText::new();
+        let mut s = ScrollbackText::default();
         s.feed(b"\x1b]0;title\x07after\n");
         assert_eq!(s.lines[0], "after");
     }
 
     #[test]
     fn find_all_case_insensitive() {
-        let mut s = ScrollbackText::new();
+        let mut s = ScrollbackText::default();
         s.feed(b"Hello World\nhello again\n");
         let m = s.find_all("hello");
         assert_eq!(m.len(), 2);
@@ -208,7 +220,7 @@ mod tests {
 
     #[test]
     fn find_all_includes_current_line() {
-        let mut s = ScrollbackText::new();
+        let mut s = ScrollbackText::default();
         s.feed(b"first\nstreaming part");
         let m = s.find_all("stream");
         assert_eq!(m.len(), 1);
@@ -217,7 +229,7 @@ mod tests {
 
     #[test]
     fn multiple_matches_per_line() {
-        let mut s = ScrollbackText::new();
+        let mut s = ScrollbackText::default();
         s.feed(b"ab ab ab\n");
         let m = s.find_all("ab");
         assert_eq!(m.len(), 3);
@@ -225,7 +237,7 @@ mod tests {
 
     #[test]
     fn lines_above_bottom_basic() {
-        let mut s = ScrollbackText::new();
+        let mut s = ScrollbackText::default();
         s.feed(b"a\nb\nc\nd\n");
         // total_lines = 4 completed + 1 current = 5; bottom-indexed at 4.
         // Line idx 0 ("a") is 4 above the bottom.
@@ -236,7 +248,7 @@ mod tests {
 
     #[test]
     fn buffer_caps_at_max_lines() {
-        let mut s = ScrollbackText::new();
+        let mut s = ScrollbackText::default();
         for i in 0..(MAX_LINES + 50) {
             s.feed(format!("line {}\n", i).as_bytes());
         }

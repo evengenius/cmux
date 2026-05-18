@@ -80,6 +80,15 @@ pub struct LayoutConfig {
     /// behaviour stays predictable.
     #[serde(default)]
     pub auto_restore: bool,
+    /// Scrollback line cap for the PTY parser AND the plain-text mirror
+    /// used by Ctrl+F. Bigger = more history at the cost of RAM (≈100B per
+    /// line × cap × open tabs). Only applies to tabs spawned after reload.
+    #[serde(default = "default_scrollback_lines")]
+    pub scrollback_lines: usize,
+}
+
+fn default_scrollback_lines() -> usize {
+    10_000
 }
 
 fn default_right_sidebar_width() -> u16 {
@@ -93,6 +102,7 @@ impl Default for LayoutConfig {
             right_sidebar_width: 42,
             bottom_height: 12,
             auto_restore: false,
+            scrollback_lines: 10_000,
         }
     }
 }
@@ -167,6 +177,9 @@ bottom_height = 12
 # When true, ~/.cmux/layout.json is restored automatically on startup
 # (otherwise use F9 → "★ Restore previous layout" once per session).
 auto_restore = false
+# PTY scrollback line cap. ~100B per line × cap × open tabs is the
+# RAM budget. Applies to tabs spawned after reload.
+scrollback_lines = 10000
 
 [browser]
 # Show dot-files (.git, .claude, etc.) in the file browser / files sidebar

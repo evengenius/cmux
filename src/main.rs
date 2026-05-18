@@ -15,7 +15,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -314,6 +314,13 @@ struct ChatTab {
     /// Plain-text mirror of the PTY output, fed alongside the vt100 parser.
     /// Used by the Ctrl+F scrollback search.
     text_buffer: Arc<Mutex<ScrollbackText>>,
+    /// Mirror of `text_buffer.total_lines()` that the reader thread updates
+    /// after every feed. Read on the hot scrollbar render path so we don't
+    /// have to take the text_buffer mutex on every frame.
+    total_lines: Arc<AtomicUsize>,
+    /// Scrollback row cap this tab was spawned with — used to clamp the
+    /// scrollbar drag math and the search jump offset.
+    scrollback_max: usize,
     /// Completed claude turns the user hasn't seen yet — incremented on every
     /// Streaming → Idle transition that happens while the tab isn't active,
     /// reset on focus. Rendered as a `[N]` badge in the chat bar. This is a
@@ -330,20 +337,26 @@ struct ChatTab {
 }
 
 impl ChatTab {
-    fn spawn(cwd: PathBuf, rows: u16, cols: u16) -> Result<Self> {
+    fn spawn(cwd: PathBuf, rows: u16, cols: u16, scrollback: usize) -> Result<Self> {
         let title = cwd
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("claude")
             .to_string();
-        Self::spawn_inner(cwd, &[], title, None, rows, cols)
+        Self::spawn_inner(cwd, &[], title, None, rows, cols, scrollback)
     }
 
     /// Spawn a fresh (non-resumed) tab with an explicit title. Used by
     /// layout restore so previously-renamed tabs keep their names instead of
     /// snapping back to the cwd basename.
-    fn spawn_with_title(cwd: PathBuf, title: String, rows: u16, cols: u16) -> Result<Self> {
-        Self::spawn_inner(cwd, &[], title, None, rows, cols)
+    fn spawn_with_title(
+        cwd: PathBuf,
+        title: String,
+        rows: u16,
+        cols: u16,
+        scrollback: usize,
+    ) -> Result<Self> {
+        Self::spawn_inner(cwd, &[], title, None, rows, cols, scrollback)
     }
 
     fn spawn_resume(
@@ -352,6 +365,7 @@ impl ChatTab {
         title: String,
         rows: u16,
         cols: u16,
+        scrollback: usize,
     ) -> Result<Self> {
         Self::spawn_inner(
             cwd,
@@ -360,6 +374,7 @@ impl ChatTab {
             Some(session_id.to_string()),
             rows,
             cols,
+            scrollback,
         )
     }
 
@@ -370,6 +385,7 @@ impl ChatTab {
         session_id: Option<String>,
         rows: u16,
         cols: u16,
+        scrollback: usize,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -402,15 +418,20 @@ impl ChatTab {
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
-        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, SCROLLBACK_LINES)));
+        // Clamp scrollback so weird config values can't OOM or zero out the
+        // buffer. `vt100::Parser` requires `scrollback >= 1`.
+        let scrollback_cap = scrollback.clamp(64, 1_000_000);
+        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, scrollback_cap)));
         let dirty = Arc::new(AtomicBool::new(true));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
-        let text_buffer = Arc::new(Mutex::new(ScrollbackText::new()));
+        let text_buffer = Arc::new(Mutex::new(ScrollbackText::with_capacity(scrollback_cap)));
+        let total_lines = Arc::new(AtomicUsize::new(1));
         let mut reader = pair.master.try_clone_reader()?;
         let parser_for_reader = parser.clone();
         let dirty_for_reader = dirty.clone();
         let activity_for_reader = last_activity.clone();
         let text_for_reader = text_buffer.clone();
+        let total_for_reader = total_lines.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -422,6 +443,9 @@ impl ChatTab {
                         }
                         if let Ok(mut t) = text_for_reader.lock() {
                             t.feed(&buf[..n]);
+                            // Publish total so the main thread can size the
+                            // scrollbar without locking text_buffer.
+                            total_for_reader.store(t.total_lines(), Ordering::Relaxed);
                         }
                         dirty_for_reader.store(true, Ordering::Release);
                         if let Ok(mut t) = activity_for_reader.lock() {
@@ -447,6 +471,8 @@ impl ChatTab {
             writer,
             child,
             text_buffer,
+            total_lines,
+            scrollback_max: scrollback_cap,
             unread_replies: 0,
             pinned: false,
             notified_awaiting: false,
@@ -493,7 +519,7 @@ impl ChatTab {
     fn scroll_up(&self) {
         let mut p = self.parser.lock().unwrap();
         let cur = p.screen().scrollback();
-        let next = (cur + SCROLL_STEP).min(SCROLLBACK_LINES);
+        let next = (cur + SCROLL_STEP).min(self.scrollback_max);
         p.set_scrollback(next);
         self.dirty.store(true, Ordering::Release);
     }
@@ -739,7 +765,9 @@ struct App {
 
 impl App {
     fn new(cwd: PathBuf, rows: u16, cols: u16) -> Result<Self> {
-        let tab = ChatTab::spawn(cwd.clone(), rows, cols)?;
+        let config = config::load();
+        let scrollback = config.layout.scrollback_lines;
+        let tab = ChatTab::spawn(cwd.clone(), rows, cols, scrollback)?;
         Ok(Self {
             tabs: vec![tab],
             active: 0,
@@ -797,7 +825,7 @@ impl App {
             confirm: ConfirmState::default(),
             layout_names: Vec::new(),
             saved_layout: layout::load(),
-            config: config::load(),
+            config,
         })
     }
 
@@ -863,7 +891,8 @@ impl App {
             .get(self.active)
             .map(|t| t.cwd.clone())
             .unwrap_or_else(|| self.cwd.clone());
-        let tab = ChatTab::spawn(cwd, rows, cols)?;
+        let scrollback = self.config.layout.scrollback_lines;
+        let tab = ChatTab::spawn(cwd, rows, cols, scrollback)?;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -1424,7 +1453,7 @@ impl App {
             .lock()
             .map(|buf| buf.lines_above_bottom(m.line_idx))
             .unwrap_or(0);
-        let capped = offset.min(SCROLLBACK_LINES);
+        let capped = offset.min(tab.scrollback_max);
         if let Ok(mut p) = tab.parser.lock() {
             p.set_scrollback(capped);
         }
@@ -1712,9 +1741,10 @@ impl App {
         let Some(&real_idx) = self.filtered.get(self.sidebar_idx) else {
             return Ok(());
         };
+        let scrollback = self.config.layout.scrollback_lines;
         let s = &self.sessions[real_idx];
         let title = truncate(&s.title, 24);
-        let tab = ChatTab::spawn_resume(s.cwd.clone(), &s.id, title, rows, cols)?;
+        let tab = ChatTab::spawn_resume(s.cwd.clone(), &s.id, title, rows, cols, scrollback)?;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.sidebar_open = false;
@@ -1753,7 +1783,8 @@ impl App {
     }
 
     fn spawn_tab_here(&mut self, cwd: PathBuf, rows: u16, cols: u16) -> Result<()> {
-        let tab = ChatTab::spawn(cwd, rows, cols)?;
+        let scrollback = self.config.layout.scrollback_lines;
+        let tab = ChatTab::spawn(cwd, rows, cols, scrollback)?;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -1786,6 +1817,7 @@ impl App {
         for mut t in self.tabs.drain(..) {
             t.kill();
         }
+        let scrollback = self.config.layout.scrollback_lines;
         for st in &saved.tabs {
             let mut tab = match &st.session_id {
                 Some(id) => ChatTab::spawn_resume(
@@ -1794,12 +1826,14 @@ impl App {
                     truncate(&st.title, 24),
                     rows,
                     cols,
+                    scrollback,
                 )?,
                 None => ChatTab::spawn_with_title(
                     st.cwd.clone(),
                     truncate(&st.title, 24),
                     rows,
                     cols,
+                    scrollback,
                 )?,
             };
             tab.pinned = st.pinned;
@@ -2644,6 +2678,7 @@ fn handle_global_sessions_key(
         }
         KeyCode::Enter => {
             if let Some(sess_idx) = app.global_sessions_selected_session() {
+                let scrollback = app.config.layout.scrollback_lines;
                 let (cwd, id, title) = {
                     let s = &app.sessions[sess_idx];
                     (s.cwd.clone(), s.id.clone(), truncate(&s.title, 24))
@@ -2654,6 +2689,7 @@ fn handle_global_sessions_key(
                     title,
                     pty_area.height.max(1),
                     pty_area.width.max(1),
+                    scrollback,
                 )?;
                 app.tabs.push(tab);
                 app.active = app.tabs.len() - 1;
@@ -2837,6 +2873,7 @@ fn handle_palette_key(
                 PaletteResult::None => return Ok(KeyOutcome::LayoutChanged),
                 PaletteResult::Run(a) => return execute_action(a, app, pty_area),
                 PaletteResult::OpenSession(idx) => {
+                    let scrollback = app.config.layout.scrollback_lines;
                     let (cwd, id, title) = {
                         let s = &app.sessions[idx];
                         (s.cwd.clone(), s.id.clone(), truncate(&s.title, 24))
@@ -2847,6 +2884,7 @@ fn handle_palette_key(
                         title,
                         pty_area.height.max(1),
                         pty_area.width.max(1),
+                        scrollback,
                     )?;
                     app.tabs.push(tab);
                     app.active = app.tabs.len() - 1;
@@ -4873,20 +4911,21 @@ fn set_scrollback_from_mouse_row(app: &mut App, row: u16, pty_area: Rect) {
     } else {
         track_max * (height - 1 - row_in_bar) / (height - 1)
     };
-    let capped = offset.min(SCROLLBACK_LINES);
     let tab = app.active_tab();
+    let capped = offset.min(tab.scrollback_max);
     if let Ok(mut p) = tab.parser.lock() {
         p.set_scrollback(capped);
     }
     tab.dirty.store(true, Ordering::Release);
 }
 
-/// Active tab's known plain-text mirror line count. Used as content length
-/// for the scrollbar.
+/// Active tab's plain-text mirror line count. Read atomically — the reader
+/// thread keeps `total_lines` in sync after every feed — so the scrollbar
+/// render path can avoid locking `text_buffer`.
 fn active_total_lines(app: &App) -> usize {
     app.tabs
         .get(app.active)
-        .and_then(|t| t.text_buffer.lock().ok().map(|b| b.total_lines()))
+        .map(|t| t.total_lines.load(Ordering::Relaxed))
         .unwrap_or(0)
 }
 
