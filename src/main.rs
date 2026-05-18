@@ -270,18 +270,14 @@ impl ChatTab {
 
     /// Inspect screen + recent output to classify what the tab is doing.
     /// Lock order (parser → last_activity) matches the reader thread.
-    fn compute_state(&self, now: Instant) -> TabState {
+    fn compute_state(&self, now: Instant, permission_patterns: &[String]) -> TabState {
         let text = {
             let p = self.parser.lock().unwrap();
             p.screen().contents().to_lowercase()
         };
         // permission prompts beat freshness — even if there's new output,
         // the important state is "waiting for the user".
-        if text.contains("do you want to")
-            || text.contains("approve")
-            || text.contains("allow this tool")
-            || text.contains("(y/n)")
-        {
+        if permission_patterns.iter().any(|pat| text.contains(pat)) {
             return TabState::AwaitingPermission;
         }
         let last = *self.last_activity.lock().unwrap();
@@ -1223,8 +1219,12 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
 
         // Recompute per-tab state. If anything changed, force redraw.
         let now = Instant::now();
-        let states: Vec<TabState> =
-            app.tabs.iter().map(|t| t.compute_state(now)).collect();
+        let patterns = &app.config.detect.permission_patterns;
+        let states: Vec<TabState> = app
+            .tabs
+            .iter()
+            .map(|t| t.compute_state(now, patterns))
+            .collect();
         if states != app.last_states {
             needs_draw = true;
             app.last_states = states;

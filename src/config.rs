@@ -10,6 +10,34 @@ pub struct Config {
     pub browser: BrowserConfig,
     #[serde(default)]
     pub shell: ShellConfig,
+    #[serde(default)]
+    pub detect: DetectConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct DetectConfig {
+    /// Substrings (lowercase) that mark the embedded claude as awaiting user
+    /// input on a permission prompt. Any match flips the tab into the
+    /// AwaitingPermission state (red blinking `!`).
+    #[serde(default = "default_permission_patterns")]
+    pub permission_patterns: Vec<String>,
+}
+
+fn default_permission_patterns() -> Vec<String> {
+    vec![
+        "do you want to".to_string(),
+        "allow this tool".to_string(),
+        "approve this".to_string(),
+        "(y/n)".to_string(),
+    ]
+}
+
+impl Default for DetectConfig {
+    fn default() -> Self {
+        Self {
+            permission_patterns: default_permission_patterns(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -116,6 +144,17 @@ args = []
 # When true, the bottom shell `cd`s to the active tab's cwd on tab switch
 # (only when the shell isn't focused, so it can't corrupt your typing).
 follow_tab_cwd = true
+
+[detect]
+# Substrings (lowercase) that mark a tab as "awaiting permission" so it
+# blinks red in the tab bar and (if enabled) fires a desktop notification.
+# Add patterns here if claude's UI uses different wording in your locale.
+permission_patterns = [
+  "do you want to",
+  "allow this tool",
+  "approve this",
+  "(y/n)",
+]
 "#;
 
 pub fn ensure_default_written() {
