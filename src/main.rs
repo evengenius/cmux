@@ -1,0 +1,3050 @@
+mod browser;
+mod config;
+mod grep;
+mod layout;
+mod sessions;
+mod shell;
+
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::Result;
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph},
+    Terminal,
+};
+use tui_term::widget::PseudoTerminal;
+use vt100::{MouseProtocolMode, Parser};
+
+use browser::{Entry as BrowserEntry, FileBrowser};
+use grep::{GrepHit, GrepJob};
+use sessions::SessionMeta;
+
+const CHROME_ROWS: u16 = 2;
+const SCROLLBACK_LINES: usize = 10_000;
+const SCROLL_STEP: usize = 3;
+// Defaults live in config::LayoutConfig::default; overridable via ~/.cmux/config.toml
+
+// ===========================================================================
+// Action — anything that can be triggered by either keyboard or mouse.
+// ===========================================================================
+#[derive(Copy, Clone)]
+enum Action {
+    NewTab,
+    CloseTab,
+    PrevTab,
+    NextTab,
+    SwitchTab(usize),
+    ToggleSidebar,
+    ToggleFilesSidebar,
+    ToggleDeepGrep,
+    ToggleMouse,
+    TogglePalette,
+    ToggleBrowser,
+    ToggleBottom,
+    ToggleCommands,
+    ToggleHelp,
+    RestoreLayout,
+    ReloadConfig,
+    Quit,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum SidebarMode {
+    Sessions,
+    Commands,
+}
+
+const CLAUDE_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "Show available slash commands"),
+    ("/clear", "Clear the conversation history"),
+    ("/compact", "Compact the conversation context"),
+    ("/cost", "Show token cost of the current session"),
+    ("/status", "Show account / connection status"),
+    ("/config", "Open the configuration menu"),
+    ("/init", "Create a CLAUDE.md project file"),
+    ("/login", "Sign in to Claude"),
+    ("/logout", "Sign out"),
+    ("/model", "Switch the active model"),
+    ("/permissions", "Manage tool permissions"),
+    ("/resume", "Pick a previous session to resume"),
+    ("/ide", "Connect to an IDE (VS Code, JetBrains)"),
+    ("/mcp", "Manage MCP servers"),
+    ("/agents", "List or invoke custom subagents"),
+    ("/memory", "Manage memory files (CLAUDE.md and friends)"),
+    ("/add-dir", "Add a working directory to the session"),
+    ("/upgrade", "Upgrade your Claude subscription"),
+    ("/release-notes", "Show release notes"),
+    ("/feedback", "Submit feedback"),
+    ("/bug", "Report a bug"),
+    ("/doctor", "Diagnose installation"),
+    ("/vim", "Toggle vim editing mode"),
+    ("/review", "Review the current pull request"),
+    ("/security-review", "Run a security review on pending changes"),
+    ("/terminal-setup", "Configure the terminal"),
+    ("/migrate-installer", "Migrate to the new installer"),
+    ("/install-github-app", "Install the Claude GitHub app"),
+    ("/pr-comments", "Show pull-request comments"),
+    ("/exit", "Exit the CLI"),
+    ("/quit", "Exit the CLI"),
+];
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ResizeDrag {
+    None,
+    Sidebar,
+    RightSidebar,
+    Bottom,
+}
+
+struct ButtonHit {
+    rect: Rect,
+    action: Action,
+}
+
+// ===========================================================================
+// TabState — what's happening inside the embedded claude right now.
+// ===========================================================================
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum TabState {
+    Idle,
+    Streaming,
+    AwaitingPermission,
+}
+
+const STREAMING_QUIET_MS: u128 = 800;
+
+// ===========================================================================
+// Command palette items
+// ===========================================================================
+enum PaletteKind {
+    Action(Action),
+    Session(usize), // index into App.sessions
+}
+
+struct PaletteItem {
+    label: String,
+    hay: String, // lowercased haystack for matching
+    kind: PaletteKind,
+}
+
+enum PaletteResult {
+    None,
+    Run(Action),
+    OpenSession(usize),
+}
+
+// ===========================================================================
+// ChatTab
+// ===========================================================================
+struct ChatTab {
+    title: String,
+    cwd: PathBuf,
+    session_id: Option<String>,
+    created_at_unix: u64,
+    parser: Arc<Mutex<Parser>>,
+    dirty: Arc<AtomicBool>,
+    last_activity: Arc<Mutex<Instant>>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn Child + Send + Sync>,
+}
+
+impl ChatTab {
+    fn spawn(cwd: PathBuf, rows: u16, cols: u16) -> Result<Self> {
+        let title = cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("claude")
+            .to_string();
+        Self::spawn_inner(cwd, &[], title, None, rows, cols)
+    }
+
+    fn spawn_resume(
+        cwd: PathBuf,
+        session_id: &str,
+        title: String,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self> {
+        Self::spawn_inner(
+            cwd,
+            &["--resume", session_id],
+            title,
+            Some(session_id.to_string()),
+            rows,
+            cols,
+        )
+    }
+
+    fn spawn_inner(
+        cwd: PathBuf,
+        extra_args: &[&str],
+        title: String,
+        session_id: Option<String>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self> {
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+
+        let mut argv: Vec<&str> = vec!["/c", "claude.cmd"];
+        argv.extend_from_slice(extra_args);
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.args(argv);
+        cmd.cwd(&cwd);
+        for (k, v) in std::env::vars() {
+            cmd.env(k, v);
+        }
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+
+        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, SCROLLBACK_LINES)));
+        let dirty = Arc::new(AtomicBool::new(true));
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+
+        let mut reader = pair.master.try_clone_reader()?;
+        let parser_for_reader = parser.clone();
+        let dirty_for_reader = dirty.clone();
+        let activity_for_reader = last_activity.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut p) = parser_for_reader.lock() {
+                            p.process(&buf[..n]);
+                        }
+                        dirty_for_reader.store(true, Ordering::Release);
+                        if let Ok(mut t) = activity_for_reader.lock() {
+                            *t = Instant::now();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let writer = pair.master.take_writer()?;
+
+        Ok(Self {
+            title,
+            cwd,
+            session_id,
+            created_at_unix: layout::now_unix(),
+            parser,
+            dirty,
+            last_activity,
+            master: pair.master,
+            writer,
+            child,
+        })
+    }
+
+    /// Inspect screen + recent output to classify what the tab is doing.
+    /// Lock order (parser → last_activity) matches the reader thread.
+    fn compute_state(&self, now: Instant) -> TabState {
+        let text = {
+            let p = self.parser.lock().unwrap();
+            p.screen().contents().to_lowercase()
+        };
+        // permission prompts beat freshness — even if there's new output,
+        // the important state is "waiting for the user".
+        if text.contains("do you want to")
+            || text.contains("approve")
+            || text.contains("allow this tool")
+            || text.contains("(y/n)")
+        {
+            return TabState::AwaitingPermission;
+        }
+        let last = *self.last_activity.lock().unwrap();
+        if now.duration_since(last).as_millis() < STREAMING_QUIET_MS {
+            return TabState::Streaming;
+        }
+        TabState::Idle
+    }
+
+    fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_all(bytes)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        self.parser.lock().unwrap().set_size(rows, cols);
+        self.dirty.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn scroll_up(&self) {
+        let mut p = self.parser.lock().unwrap();
+        let cur = p.screen().scrollback();
+        let next = (cur + SCROLL_STEP).min(SCROLLBACK_LINES);
+        p.set_scrollback(next);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn scroll_down(&self) {
+        let mut p = self.parser.lock().unwrap();
+        let cur = p.screen().scrollback();
+        let next = cur.saturating_sub(SCROLL_STEP);
+        p.set_scrollback(next);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn scroll_reset(&self) {
+        let mut p = self.parser.lock().unwrap();
+        if p.screen().scrollback() != 0 {
+            p.set_scrollback(0);
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    fn is_dead(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
+
+    fn mouse_enabled(&self) -> bool {
+        let p = self.parser.lock().unwrap();
+        !matches!(p.screen().mouse_protocol_mode(), MouseProtocolMode::None)
+    }
+}
+
+// ===========================================================================
+// BottomTerminal — embedded parent-shell PTY shown at the bottom of the screen.
+// ===========================================================================
+struct BottomTerminal {
+    parser: Arc<Mutex<Parser>>,
+    dirty: Arc<AtomicBool>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    shell_label: String,
+}
+
+impl BottomTerminal {
+    fn spawn(
+        rows: u16,
+        cols: u16,
+        shell_override: Option<(String, Vec<String>)>,
+    ) -> Result<Self> {
+        let (exe, args) = shell_override.unwrap_or_else(shell::detect_parent_shell);
+        let cwd = std::env::current_dir()?;
+
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+
+        let mut cmd = CommandBuilder::new(&exe);
+        for a in &args {
+            cmd.arg(a);
+        }
+        cmd.cwd(&cwd);
+        for (k, v) in std::env::vars() {
+            cmd.env(k, v);
+        }
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+
+        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, SCROLLBACK_LINES)));
+        let dirty = Arc::new(AtomicBool::new(true));
+
+        let mut reader = pair.master.try_clone_reader()?;
+        let parser_for_reader = parser.clone();
+        let dirty_for_reader = dirty.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut p) = parser_for_reader.lock() {
+                            p.process(&buf[..n]);
+                        }
+                        dirty_for_reader.store(true, Ordering::Release);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let writer = pair.master.take_writer()?;
+
+        Ok(Self {
+            parser,
+            dirty,
+            master: pair.master,
+            writer,
+            child,
+            shell_label: shell::short_name(&exe),
+        })
+    }
+
+    fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_all(bytes)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        self.parser.lock().unwrap().set_size(rows, cols);
+        self.dirty.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+// ===========================================================================
+// App
+// ===========================================================================
+struct App {
+    tabs: Vec<ChatTab>,
+    active: usize,
+    cwd: PathBuf,
+    tab_rects: Vec<Rect>,
+    new_tab_rect: Option<Rect>,
+    // sessions sidebar
+    sessions: Vec<SessionMeta>,
+    sessions_loaded: bool,
+    sidebar_open: bool,
+    sidebar_focused: bool,
+    sidebar_mode: SidebarMode,
+    sidebar_idx: usize,
+    sidebar_scroll: usize,
+    filter: String,
+    filtered: Vec<usize>,
+    deep_grep: bool,
+    grep_job: Option<GrepJob>,
+    grep_hits: Vec<GrepHit>,
+    // chrome / input modes
+    mouse_on: bool,
+    mouse_capture_dirty: bool,
+    button_hits: Vec<ButtonHit>,
+    last_states: Vec<TabState>,
+    // command palette
+    palette_open: bool,
+    palette_query: String,
+    palette_items: Vec<PaletteItem>,
+    palette_filtered: Vec<usize>,
+    palette_idx: usize,
+    // file browser (modal F6)
+    browser_open: bool,
+    browser: Option<FileBrowser>,
+    // right files sidebar (Ctrl+B)
+    right_sidebar_open: bool,
+    right_sidebar_focused: bool,
+    right_sidebar_area: Rect,
+    // bottom terminal pane
+    bottom: Option<BottomTerminal>,
+    bottom_open: bool,
+    bottom_focused: bool,
+    bottom_area: Rect,
+    // remembered geometry for hit-testing
+    sidebar_area: Rect,
+    body_bottom_y: u16,
+    // mouse drag state
+    resize_drag: ResizeDrag,
+    // commands sidebar
+    commands_filtered: Vec<usize>,
+    // help overlay
+    help_open: bool,
+    // persisted layout (if any was found at startup)
+    saved_layout: Option<layout::SavedLayout>,
+    // user config
+    config: config::Config,
+}
+
+impl App {
+    fn new(cwd: PathBuf, rows: u16, cols: u16) -> Result<Self> {
+        let tab = ChatTab::spawn(cwd.clone(), rows, cols)?;
+        Ok(Self {
+            tabs: vec![tab],
+            active: 0,
+            cwd,
+            tab_rects: Vec::new(),
+            new_tab_rect: None,
+            sessions: Vec::new(),
+            sessions_loaded: false,
+            sidebar_open: false,
+            sidebar_focused: false,
+            sidebar_mode: SidebarMode::Sessions,
+            sidebar_idx: 0,
+            sidebar_scroll: 0,
+            filter: String::new(),
+            filtered: Vec::new(),
+            deep_grep: false,
+            grep_job: None,
+            grep_hits: Vec::new(),
+            mouse_on: true,
+            mouse_capture_dirty: false,
+            button_hits: Vec::new(),
+            last_states: Vec::new(),
+            palette_open: false,
+            palette_query: String::new(),
+            palette_items: Vec::new(),
+            palette_filtered: Vec::new(),
+            palette_idx: 0,
+            browser_open: false,
+            browser: None,
+            right_sidebar_open: false,
+            right_sidebar_focused: false,
+            right_sidebar_area: Rect::default(),
+            bottom: None,
+            bottom_open: false,
+            bottom_focused: false,
+            bottom_area: Rect::default(),
+            sidebar_area: Rect::default(),
+            body_bottom_y: 0,
+            resize_drag: ResizeDrag::None,
+            commands_filtered: (0..CLAUDE_COMMANDS.len()).collect(),
+            help_open: false,
+            saved_layout: layout::load(),
+            config: config::load(),
+        })
+    }
+
+    fn active_tab(&mut self) -> &mut ChatTab {
+        &mut self.tabs[self.active]
+    }
+
+    fn open_tab(&mut self, rows: u16, cols: u16) -> Result<()> {
+        let tab = ChatTab::spawn(self.cwd.clone(), rows, cols)?;
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        Ok(())
+    }
+
+    fn close_active(&mut self) -> bool {
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        let mut t = self.tabs.remove(self.active);
+        t.kill();
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        true
+    }
+
+    fn next_tab(&mut self) {
+        if !self.tabs.is_empty() {
+            self.active = (self.active + 1) % self.tabs.len();
+        }
+    }
+
+    fn prev_tab(&mut self) {
+        if !self.tabs.is_empty() {
+            self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+        }
+    }
+
+    fn switch(&mut self, idx: usize) {
+        if idx < self.tabs.len() {
+            self.active = idx;
+        }
+    }
+
+    fn resize_all(&mut self, rows: u16, cols: u16) -> Result<()> {
+        for t in &mut self.tabs {
+            t.resize(rows, cols)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_dead(&mut self) {
+        let mut i = 0;
+        while i < self.tabs.len() {
+            if self.tabs[i].is_dead() {
+                self.tabs.remove(i);
+                if self.active >= self.tabs.len() && self.active > 0 {
+                    self.active -= 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn kill_all(&mut self) {
+        for t in &mut self.tabs {
+            t.kill();
+        }
+        if let Some(b) = self.bottom.as_mut() {
+            b.kill();
+        }
+    }
+
+    fn toggle_sidebar(&mut self) {
+        // Same mode → close (regardless of focus). Use mouse to re-focus.
+        if self.sidebar_open && self.sidebar_mode == SidebarMode::Sessions {
+            self.sidebar_open = false;
+            self.sidebar_focused = false;
+            return;
+        }
+        self.sidebar_mode = SidebarMode::Sessions;
+        if !self.sessions_loaded {
+            let root = sessions::claude_projects_root();
+            self.sessions = sessions::enumerate(&root);
+            self.sessions_loaded = true;
+        }
+        self.sidebar_open = true;
+        self.sidebar_focused = true;
+        self.sidebar_idx = 0;
+        self.sidebar_scroll = 0;
+        self.apply_filter();
+    }
+
+    fn toggle_commands_sidebar(&mut self) {
+        if self.sidebar_open && self.sidebar_mode == SidebarMode::Commands {
+            self.sidebar_open = false;
+            self.sidebar_focused = false;
+            return;
+        }
+        self.sidebar_mode = SidebarMode::Commands;
+        self.sidebar_open = true;
+        self.sidebar_focused = true;
+        self.sidebar_idx = 0;
+        self.sidebar_scroll = 0;
+        self.filter.clear();
+        self.apply_commands_filter();
+    }
+
+    fn apply_commands_filter(&mut self) {
+        let q = self.filter.to_lowercase();
+        self.commands_filtered = if q.is_empty() {
+            (0..CLAUDE_COMMANDS.len()).collect()
+        } else {
+            CLAUDE_COMMANDS
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (name, desc))| {
+                    if name.to_lowercase().contains(&q) || desc.to_lowercase().contains(&q) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        if self.sidebar_idx >= self.commands_filtered.len() {
+            self.sidebar_idx = self.commands_filtered.len().saturating_sub(1);
+        }
+        self.sidebar_scroll = 0;
+    }
+
+    fn toggle_help(&mut self) {
+        self.help_open = !self.help_open;
+    }
+
+    fn toggle_files_sidebar(&mut self) {
+        if self.right_sidebar_open {
+            self.right_sidebar_open = false;
+            self.right_sidebar_focused = false;
+            return;
+        }
+        self.right_sidebar_open = true;
+        self.right_sidebar_focused = true;
+        // unfocus left so keys go to right
+        self.sidebar_focused = false;
+        self.ensure_browser_for_active_tab();
+    }
+
+    fn ensure_browser_for_active_tab(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let active_cwd = self.tabs[self.active].cwd.clone();
+        let show_hidden = self.config.browser.show_hidden;
+        let needs_new = match self.browser.as_ref() {
+            None => true,
+            Some(b) => b.root.as_deref() != Some(active_cwd.as_path()),
+        };
+        if needs_new {
+            self.browser = Some(FileBrowser::new_chrooted(
+                active_cwd.clone(),
+                show_hidden,
+                active_cwd,
+            ));
+        }
+    }
+
+    fn reload_config(&mut self) {
+        self.config = config::load();
+        if let Some(b) = self.browser.as_mut() {
+            b.set_show_hidden(self.config.browser.show_hidden);
+        }
+    }
+
+    /// Call after any change that may have shifted the active tab.
+    fn on_active_changed(&mut self) {
+        if self.right_sidebar_open {
+            self.ensure_browser_for_active_tab();
+        }
+    }
+
+    fn apply_filter(&mut self) {
+        // Cancel any running grep — query or mode may have changed.
+        if let Some(job) = self.grep_job.take() {
+            job.cancel();
+        }
+        self.grep_hits.clear();
+
+        if self.deep_grep && !self.filter.is_empty() {
+            // Deep-grep path: filtered list is populated incrementally by
+            // run-loop draining the channel. Start empty.
+            self.filtered = Vec::new();
+            let targets: Vec<_> = self
+                .sessions
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, s.file_path.clone()))
+                .collect();
+            self.grep_job = Some(grep::spawn(targets, self.filter.clone()));
+        } else {
+            // Metadata-only filter (instant).
+            let q = self.filter.to_lowercase();
+            self.filtered = if q.is_empty() {
+                (0..self.sessions.len()).collect()
+            } else {
+                self.sessions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| {
+                        let hay = format!(
+                            "{}\n{}\n{}\n{}",
+                            s.title.to_lowercase(),
+                            sessions::cwd_label(&s.cwd).to_lowercase(),
+                            s.git_branch.as_deref().unwrap_or("").to_lowercase(),
+                            s.project_dir.to_lowercase()
+                        );
+                        if hay.contains(&q) {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+        }
+        if self.sidebar_idx >= self.filtered.len() {
+            self.sidebar_idx = self.filtered.len().saturating_sub(1);
+        }
+        self.sidebar_scroll = 0;
+    }
+
+    fn toggle_deep_grep(&mut self) {
+        self.deep_grep = !self.deep_grep;
+        self.apply_filter();
+    }
+
+    fn toggle_palette(&mut self) {
+        if self.palette_open {
+            self.close_palette();
+        } else {
+            self.open_palette();
+        }
+    }
+
+    fn open_palette(&mut self) {
+        // Load sessions lazily, same as F3 sidebar.
+        if !self.sessions_loaded {
+            let root = sessions::claude_projects_root();
+            self.sessions = sessions::enumerate(&root);
+            self.sessions_loaded = true;
+        }
+        self.rebuild_palette_items();
+        self.palette_query.clear();
+        self.palette_idx = 0;
+        self.apply_palette_filter();
+        self.palette_open = true;
+    }
+
+    fn close_palette(&mut self) {
+        self.palette_open = false;
+        self.palette_query.clear();
+    }
+
+    fn rebuild_palette_items(&mut self) {
+        let mut items: Vec<PaletteItem> = Vec::new();
+        let push_action = |items: &mut Vec<PaletteItem>, label: &str, action: Action| {
+            items.push(PaletteItem {
+                label: label.to_string(),
+                hay: label.to_lowercase(),
+                kind: PaletteKind::Action(action),
+            });
+        };
+        push_action(&mut items, "★  New tab", Action::NewTab);
+        push_action(&mut items, "★  Close active tab", Action::CloseTab);
+        push_action(&mut items, "★  Previous tab", Action::PrevTab);
+        push_action(&mut items, "★  Next tab", Action::NextTab);
+        push_action(&mut items, "★  Toggle sessions sidebar", Action::ToggleSidebar);
+        push_action(&mut items, "★  Toggle commands sidebar", Action::ToggleCommands);
+        push_action(&mut items, "★  Toggle files sidebar", Action::ToggleFilesSidebar);
+        push_action(&mut items, "★  Show help overlay", Action::ToggleHelp);
+        push_action(&mut items, "★  Toggle deep-grep", Action::ToggleDeepGrep);
+        push_action(&mut items, "★  Open file browser (modal)", Action::ToggleBrowser);
+        push_action(&mut items, "★  Toggle bottom terminal", Action::ToggleBottom);
+        push_action(&mut items, "★  Toggle mouse mode", Action::ToggleMouse);
+        let cfg_path = config::config_path();
+        let cfg_label = format!("★  Reload config ({})", cfg_path.display());
+        items.push(PaletteItem {
+            label: cfg_label.clone(),
+            hay: cfg_label.to_lowercase(),
+            kind: PaletteKind::Action(Action::ReloadConfig),
+        });
+        if let Some(saved) = &self.saved_layout {
+            let label = format!(
+                "★  Restore previous layout ({} tabs from {})",
+                saved.tabs.len(),
+                relative_unix(saved.saved_at_unix)
+            );
+            items.push(PaletteItem {
+                label: label.clone(),
+                hay: label.to_lowercase(),
+                kind: PaletteKind::Action(Action::RestoreLayout),
+            });
+        }
+        push_action(&mut items, "★  Quit", Action::Quit);
+
+        for (i, s) in self.sessions.iter().enumerate() {
+            let cwd = sessions::cwd_label(&s.cwd);
+            let branch = s.git_branch.as_deref().unwrap_or("");
+            let label = format!("⤴  {}  ·  {}  ·  {}", s.title, cwd, branch);
+            let hay = format!(
+                "{}\n{}\n{}\n{}",
+                s.title.to_lowercase(),
+                cwd.to_lowercase(),
+                branch.to_lowercase(),
+                s.project_dir.to_lowercase()
+            );
+            items.push(PaletteItem {
+                label,
+                hay,
+                kind: PaletteKind::Session(i),
+            });
+        }
+
+        self.palette_items = items;
+    }
+
+    fn apply_palette_filter(&mut self) {
+        let q = self.palette_query.to_lowercase();
+        self.palette_filtered = if q.is_empty() {
+            (0..self.palette_items.len()).collect()
+        } else {
+            self.palette_items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, it)| if it.hay.contains(&q) { Some(i) } else { None })
+                .collect()
+        };
+        if self.palette_idx >= self.palette_filtered.len() {
+            self.palette_idx = self.palette_filtered.len().saturating_sub(1);
+        }
+    }
+
+    fn palette_take_selection(&mut self) -> PaletteResult {
+        let Some(&item_idx) = self.palette_filtered.get(self.palette_idx) else {
+            return PaletteResult::None;
+        };
+        match self.palette_items[item_idx].kind {
+            PaletteKind::Action(a) => PaletteResult::Run(a),
+            PaletteKind::Session(s) => PaletteResult::OpenSession(s),
+        }
+    }
+
+    /// Pull whatever the grep thread has produced. Returns true if anything
+    /// changed (caller should redraw).
+    fn poll_grep(&mut self) -> bool {
+        let Some(job) = &self.grep_job else {
+            return false;
+        };
+        let (pushed, completed) = grep::drain(job, &mut self.grep_hits);
+        if pushed {
+            self.filtered = self.grep_hits.iter().map(|h| h.session_idx).collect();
+            if self.sidebar_idx >= self.filtered.len() {
+                self.sidebar_idx = self.filtered.len().saturating_sub(1);
+            }
+        }
+        if completed {
+            self.grep_job = None;
+        }
+        pushed || completed
+    }
+
+    fn open_selected_session(&mut self, rows: u16, cols: u16) -> Result<()> {
+        let Some(&real_idx) = self.filtered.get(self.sidebar_idx) else {
+            return Ok(());
+        };
+        let s = &self.sessions[real_idx];
+        let title = truncate(&s.title, 24);
+        let tab = ChatTab::spawn_resume(s.cwd.clone(), &s.id, title, rows, cols)?;
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        self.sidebar_open = false;
+        self.sidebar_focused = false;
+        self.filter.clear();
+        if let Some(job) = self.grep_job.take() {
+            job.cancel();
+        }
+        self.grep_hits.clear();
+        self.on_active_changed();
+        self.save_layout();
+        Ok(())
+    }
+
+    fn toggle_browser(&mut self) {
+        if self.browser_open {
+            self.browser_open = false;
+        } else {
+            if self.browser.is_none() {
+                self.browser = Some(FileBrowser::new(
+                    self.cwd.clone(),
+                    self.config.browser.show_hidden,
+                ));
+            }
+            self.browser_open = true;
+        }
+    }
+
+    fn spawn_tab_here(&mut self, cwd: PathBuf, rows: u16, cols: u16) -> Result<()> {
+        let tab = ChatTab::spawn(cwd, rows, cols)?;
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        Ok(())
+    }
+
+    fn save_layout(&self) {
+        // Resolve a session_id for each tab. Resumed tabs already have one;
+        // for fresh tabs we pick the most recently updated jsonl in
+        // ~/.claude/projects whose cwd matches and which was modified after
+        // the tab was opened.
+        let projects_root = sessions::claude_projects_root();
+        let sessions_all = sessions::enumerate(&projects_root);
+
+        let saved_tabs: Vec<layout::SavedTab> = self
+            .tabs
+            .iter()
+            .map(|t| {
+                let resolved_id = match &t.session_id {
+                    Some(id) => Some(id.clone()),
+                    None => sessions_all
+                        .iter()
+                        .find(|s| {
+                            s.cwd == t.cwd
+                                && s.updated
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0)
+                                    >= t.created_at_unix
+                        }) // sessions_all is already sorted by `updated` desc
+                        .map(|s| s.id.clone()),
+                };
+                layout::SavedTab {
+                    cwd: t.cwd.clone(),
+                    session_id: resolved_id,
+                    title: t.title.clone(),
+                    created_at_unix: t.created_at_unix,
+                }
+            })
+            .collect();
+
+        let layout = layout::SavedLayout {
+            version: 1,
+            saved_at_unix: layout::now_unix(),
+            active: self.active,
+            tabs: saved_tabs,
+            sidebar_open: self.sidebar_open,
+            bottom_open: self.bottom_open,
+        };
+        let _ = layout::save(&layout);
+    }
+
+    fn restore_layout(&mut self, rows: u16, cols: u16) -> Result<()> {
+        let Some(saved) = self.saved_layout.clone() else {
+            return Ok(());
+        };
+        if saved.tabs.is_empty() {
+            return Ok(());
+        }
+        // close current tabs
+        for mut t in self.tabs.drain(..) {
+            t.kill();
+        }
+        // spawn restored tabs
+        for st in &saved.tabs {
+            let tab = match &st.session_id {
+                Some(id) => ChatTab::spawn_resume(
+                    st.cwd.clone(),
+                    id,
+                    truncate(&st.title, 24),
+                    rows,
+                    cols,
+                )?,
+                None => ChatTab::spawn(st.cwd.clone(), rows, cols)?,
+            };
+            self.tabs.push(tab);
+        }
+        self.active = saved.active.min(self.tabs.len().saturating_sub(1));
+        if self.bottom.is_none() && saved.bottom_open {
+            let h = self.config.layout.bottom_height.saturating_sub(1).max(1);
+            let shell_override = self.config.shell.override_pair();
+            self.bottom = Some(BottomTerminal::spawn(h, 80, shell_override)?);
+            self.bottom_open = true;
+        }
+        // Consume the saved layout so the palette no longer offers Restore.
+        self.saved_layout = None;
+        self.save_layout(); // overwrite with current state
+        Ok(())
+    }
+
+    fn toggle_bottom(&mut self) -> Result<()> {
+        if self.bottom_open {
+            self.bottom_open = false;
+            self.bottom_focused = false;
+            return Ok(());
+        }
+        if self.bottom.is_none() {
+            // Bottom pane has one Borders::TOP row of chrome.
+            let h = self.config.layout.bottom_height.saturating_sub(1).max(1);
+            let shell_override = self.config.shell.override_pair();
+            self.bottom = Some(BottomTerminal::spawn(h, 80, shell_override)?);
+        }
+        self.bottom_open = true;
+        self.bottom_focused = true;
+        Ok(())
+    }
+}
+
+fn relative_unix(then: u64) -> String {
+    let now = layout::now_unix();
+    if then == 0 || then > now {
+        return "just now".to_string();
+    }
+    let d = now - then;
+    if d < 60 {
+        format!("{}s ago", d)
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86_400)
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let collected: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        format!("{}…", collected)
+    } else {
+        collected
+    }
+}
+
+// ===========================================================================
+// Entry
+// ===========================================================================
+fn main() -> Result<()> {
+    config::ensure_default_written();
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let size = terminal.size()?;
+    let pty_rows = size.height.saturating_sub(CHROME_ROWS).max(1);
+    let pty_cols = size.width.max(1);
+
+    let cwd = std::env::current_dir()?;
+    let mut app = App::new(cwd, pty_rows, pty_cols)?;
+
+    let result = run(&mut terminal, &mut app);
+
+    app.save_layout();
+    app.kill_all();
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    result
+}
+
+enum KeyOutcome {
+    Continue,
+    LayoutChanged,
+    Quit,
+}
+
+fn run<B: ratatui::backend::Backend + std::io::Write>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> Result<()> {
+    let mut needs_draw = true;
+    let mut last_pty_area = Rect::default();
+    let mut applied_pty_size: Option<(u16, u16)> = None;
+
+    loop {
+        app.cleanup_dead();
+        if app.tabs.is_empty() {
+            return Ok(());
+        }
+
+        // Apply pending mouse-capture mode change
+        if app.mouse_capture_dirty {
+            if app.mouse_on {
+                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+            } else {
+                execute!(terminal.backend_mut(), DisableMouseCapture)?;
+            }
+            terminal.clear()?;
+            needs_draw = true;
+            app.mouse_capture_dirty = false;
+        }
+
+        if app.active_tab().dirty.swap(false, Ordering::Acquire) {
+            needs_draw = true;
+        }
+
+        if let Some(bt) = app.bottom.as_ref() {
+            if app.bottom_open && bt.dirty.swap(false, Ordering::Acquire) {
+                needs_draw = true;
+            }
+        }
+
+        if app.poll_grep() {
+            needs_draw = true;
+        }
+
+        // Recompute per-tab state. If anything changed, force redraw.
+        let now = Instant::now();
+        let states: Vec<TabState> =
+            app.tabs.iter().map(|t| t.compute_state(now)).collect();
+        if states != app.last_states {
+            needs_draw = true;
+            app.last_states = states;
+        }
+
+        if needs_draw {
+            terminal.draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                    ])
+                    .split(f.area());
+
+                let (line, rects, new_rect) =
+                    render_tab_bar(&app.tabs, &app.last_states, app.active, chunks[0]);
+                app.tab_rects = rects;
+                app.new_tab_rect = Some(new_rect);
+                let tab_bar = Paragraph::new(line).style(Style::default().bg(Color::Black));
+                f.render_widget(tab_bar, chunks[0]);
+
+                // Body: split off bottom terminal first (vertical),
+                // then sidebar from what remains (horizontal).
+                let body = chunks[1];
+                let (upper_body, bottom_pane_area) = if app.bottom_open {
+                    let h = app
+                        .config
+                        .layout
+                        .bottom_height
+                        .max(4)
+                        .min(body.height.saturating_sub(5));
+                    let v = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(1), Constraint::Length(h)])
+                        .split(body);
+                    (v[0], Some(v[1]))
+                } else {
+                    (body, None)
+                };
+
+                // Compute widths for both sidebars (clamped to fit)
+                let total_w = upper_body.width;
+                let left_w = if app.sidebar_open {
+                    app.config.layout.sidebar_width.max(20).min(total_w.saturating_sub(20))
+                } else {
+                    0
+                };
+                let right_w = if app.right_sidebar_open {
+                    app.config
+                        .layout
+                        .right_sidebar_width
+                        .max(20)
+                        .min(total_w.saturating_sub(left_w + 20))
+                } else {
+                    0
+                };
+
+                let mut hconstraints: Vec<Constraint> = Vec::new();
+                if left_w > 0 {
+                    hconstraints.push(Constraint::Length(left_w));
+                }
+                hconstraints.push(Constraint::Min(1));
+                if right_w > 0 {
+                    hconstraints.push(Constraint::Length(right_w));
+                }
+                let h_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(hconstraints)
+                    .split(upper_body);
+
+                let mut hi = 0usize;
+                let left_area_opt = if left_w > 0 {
+                    let r = Some(h_chunks[hi]);
+                    hi += 1;
+                    r
+                } else {
+                    None
+                };
+                let pty_area_outer = h_chunks[hi];
+                hi += 1;
+                let right_area_opt = if right_w > 0 {
+                    Some(h_chunks[hi])
+                } else {
+                    None
+                };
+
+                // Bordered main PTY area; border colour reflects focus.
+                let main_focused = !app.sidebar_focused
+                    && !app.right_sidebar_focused
+                    && !app.bottom_focused;
+                let main_color = if main_focused {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                };
+                let main_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(main_color))
+                    .title(if main_focused { " chat ● " } else { " chat ○ " });
+                let pty_area = main_block.inner(pty_area_outer);
+                f.render_widget(main_block, pty_area_outer);
+
+                last_pty_area = pty_area;
+                app.bottom_area = bottom_pane_area.unwrap_or_default();
+                app.sidebar_area = left_area_opt.unwrap_or_default();
+                app.right_sidebar_area = right_area_opt.unwrap_or_default();
+                app.body_bottom_y = body.y + body.height;
+
+                if let Some(sb) = left_area_opt {
+                    render_sidebar(f, sb, app);
+                }
+                if let Some(sb) = right_area_opt {
+                    render_files_sidebar(f, sb, app);
+                }
+
+                let p = app.tabs[app.active].parser.lock().unwrap();
+                let term = PseudoTerminal::new(p.screen());
+                f.render_widget(term, pty_area);
+
+                let scroll_off = p.screen().scrollback();
+                drop(p);
+
+                let info_tag = if scroll_off > 0 {
+                    Some(format!("SCROLL -{}", scroll_off))
+                } else if !app.mouse_on {
+                    Some("MOUSE OFF · Shift+select".to_string())
+                } else {
+                    None
+                };
+                // Bottom terminal pane (drawn after main pty, before overlays)
+                if let Some(area) = bottom_pane_area {
+                    render_bottom_pane(f, area, app);
+                }
+
+                let (line, hits) = render_button_bar(chunks[2], app, info_tag.as_deref());
+                app.button_hits = hits;
+                f.render_widget(
+                    Paragraph::new(line).style(Style::default().bg(Color::DarkGray)),
+                    chunks[2],
+                );
+
+                // Overlays — drawn last so they sit on top of everything.
+                if app.browser_open {
+                    render_browser(f, f.area(), app);
+                }
+                if app.palette_open {
+                    render_palette(f, f.area(), app);
+                }
+                if app.help_open {
+                    render_help(f, f.area());
+                }
+            })?;
+            needs_draw = false;
+        }
+
+        // After draw, last_pty_area is current. Resize tabs if it changed.
+        let want = (last_pty_area.height.max(1), last_pty_area.width.max(1));
+        if applied_pty_size != Some(want) && want.0 > 0 && want.1 > 0 {
+            app.resize_all(want.0, want.1)?;
+            applied_pty_size = Some(want);
+        }
+
+        // Resize bottom pane too if open and area changed. Bottom area is
+        // outer (includes Borders::TOP), so subtract 1 for the inner PTY size.
+        if app.bottom_open && app.bottom_area.width > 0 && app.bottom_area.height > 0 {
+            if let Some(bt) = app.bottom.as_mut() {
+                let inner_h = app.bottom_area.height.saturating_sub(1).max(1);
+                let _ = bt.resize(inner_h, app.bottom_area.width.max(1));
+            }
+        }
+
+        if event::poll(Duration::from_millis(16))? {
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    match handle_key(k, app, last_pty_area)? {
+                        KeyOutcome::Quit => return Ok(()),
+                        KeyOutcome::LayoutChanged => {
+                            terminal.clear()?;
+                            needs_draw = true;
+                            applied_pty_size = None;
+                        }
+                        KeyOutcome::Continue => {
+                            needs_draw = true;
+                        }
+                    }
+                }
+                Event::Mouse(me) => {
+                    if let Some(action) = handle_mouse(me, app, last_pty_area)? {
+                        match execute_action(action, app, last_pty_area)? {
+                            KeyOutcome::Quit => return Ok(()),
+                            KeyOutcome::LayoutChanged => {
+                                terminal.clear()?;
+                                needs_draw = true;
+                                applied_pty_size = None;
+                            }
+                            KeyOutcome::Continue => {
+                                needs_draw = true;
+                            }
+                        }
+                    } else {
+                        needs_draw = true;
+                    }
+                }
+                Event::Resize(cols, rows) => {
+                    let new_rows = rows.saturating_sub(CHROME_ROWS).max(1);
+                    let _ = new_rows;
+                    let _ = cols;
+                    // Actual size is recomputed from the next draw; just clear and redraw.
+                    terminal.clear()?;
+                    needs_draw = true;
+                    applied_pty_size = None;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Tab bar
+// ===========================================================================
+fn render_tab_bar(
+    tabs: &[ChatTab],
+    states: &[TabState],
+    active: usize,
+    area: Rect,
+) -> (Line<'static>, Vec<Rect>, Rect) {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut rects = Vec::with_capacity(tabs.len());
+    let mut x = area.x;
+
+    for (i, t) in tabs.iter().enumerate() {
+        let state = states.get(i).copied().unwrap_or(TabState::Idle);
+        let (dot, dot_style) = match state {
+            TabState::Idle => (None, None),
+            TabState::Streaming => (
+                Some(" ● "),
+                Some(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ),
+            TabState::AwaitingPermission => (
+                Some(" ! "),
+                Some(
+                    Style::default()
+                        .fg(Color::Red)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+                ),
+            ),
+        };
+
+        let label = format!(" {}: {} ", i + 1, t.title);
+        let label_w = label.chars().count() as u16;
+        let dot_w = dot.map(|s| s.chars().count() as u16).unwrap_or(0);
+        let total_w = label_w + dot_w;
+
+        let label_style = if i == active {
+            Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(Color::DarkGray).fg(Color::Gray)
+        };
+        let label_bg = if i == active { Color::White } else { Color::DarkGray };
+
+        spans.push(Span::styled(label, label_style));
+        if let (Some(d), Some(ds)) = (dot, dot_style) {
+            // keep the dot's cell on the tab's background so it reads as part of the tab
+            spans.push(Span::styled(d, ds.bg(label_bg)));
+        }
+        spans.push(Span::raw(" "));
+        rects.push(Rect {
+            x,
+            y: area.y,
+            width: total_w,
+            height: 1,
+        });
+        x = x.saturating_add(total_w + 1);
+    }
+
+    let plus = " + ";
+    let new_rect = Rect {
+        x,
+        y: area.y,
+        width: plus.chars().count() as u16,
+        height: 1,
+    };
+    spans.push(Span::styled(
+        plus,
+        Style::default().bg(Color::DarkGray).fg(Color::Green),
+    ));
+
+    (Line::from(spans), rects, new_rect)
+}
+
+// ===========================================================================
+// Palette key handler
+// ===========================================================================
+fn handle_palette_key(
+    k: crossterm::event::KeyEvent,
+    app: &mut App,
+    pty_area: Rect,
+) -> Result<KeyOutcome> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+
+    match k.code {
+        KeyCode::Esc => {
+            app.close_palette();
+            return Ok(KeyOutcome::LayoutChanged);
+        }
+        KeyCode::Up => {
+            app.palette_idx = app.palette_idx.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let max = app.palette_filtered.len().saturating_sub(1);
+            app.palette_idx = (app.palette_idx + 1).min(max);
+        }
+        KeyCode::PageUp => {
+            app.palette_idx = app.palette_idx.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            let max = app.palette_filtered.len().saturating_sub(1);
+            app.palette_idx = (app.palette_idx + 10).min(max);
+        }
+        KeyCode::Home => {
+            app.palette_idx = 0;
+        }
+        KeyCode::End => {
+            app.palette_idx = app.palette_filtered.len().saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            let result = app.palette_take_selection();
+            app.close_palette();
+            match result {
+                PaletteResult::None => return Ok(KeyOutcome::LayoutChanged),
+                PaletteResult::Run(a) => return execute_action(a, app, pty_area),
+                PaletteResult::OpenSession(idx) => {
+                    let (cwd, id, title) = {
+                        let s = &app.sessions[idx];
+                        (s.cwd.clone(), s.id.clone(), truncate(&s.title, 24))
+                    };
+                    let tab = ChatTab::spawn_resume(
+                        cwd,
+                        &id,
+                        title,
+                        pty_area.height.max(1),
+                        pty_area.width.max(1),
+                    )?;
+                    app.tabs.push(tab);
+                    app.active = app.tabs.len() - 1;
+                    app.on_active_changed();
+                    app.save_layout();
+                    return Ok(KeyOutcome::LayoutChanged);
+                }
+            }
+        }
+        KeyCode::Backspace if app.palette_query.pop().is_some() => {
+            app.apply_palette_filter();
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            app.palette_query.push(c);
+            app.apply_palette_filter();
+        }
+        _ => {}
+    }
+    Ok(KeyOutcome::Continue)
+}
+
+// ===========================================================================
+// Files-sidebar key handler — same actions as F6 modal but Esc closes sidebar.
+// ===========================================================================
+fn handle_files_sidebar_key(
+    k: crossterm::event::KeyEvent,
+    app: &mut App,
+    pty_area: Rect,
+) -> Result<KeyOutcome> {
+    let Some(br) = app.browser.as_mut() else {
+        app.right_sidebar_open = false;
+        return Ok(KeyOutcome::LayoutChanged);
+    };
+
+    match k.code {
+        KeyCode::Esc => {
+            app.right_sidebar_focused = false;
+            return Ok(KeyOutcome::Continue);
+        }
+        KeyCode::Up => br.move_up(),
+        KeyCode::Down => br.move_down(),
+        KeyCode::PageUp => br.page_up(),
+        KeyCode::PageDown => br.page_down(),
+        KeyCode::Home => br.home(),
+        KeyCode::End => br.end(),
+        KeyCode::Left | KeyCode::Backspace => br.cd_parent(),
+        KeyCode::Right => {
+            let name = match br.selected() {
+                Some(BrowserEntry::Dir(n)) => Some(n.clone()),
+                _ => None,
+            };
+            if let Some(n) = name {
+                br.cd_into(&n);
+            }
+        }
+        KeyCode::Char(' ') => {
+            // Insert the selected path into the active claude's input.
+            let path = match br.selected() {
+                Some(BrowserEntry::Dir(n)) | Some(BrowserEntry::File(n)) => {
+                    Some(br.cwd.join(n))
+                }
+                Some(BrowserEntry::OpenHere) => Some(br.cwd.clone()),
+                Some(BrowserEntry::Parent) | None => None,
+            };
+            if let Some(p) = path {
+                let root = app.tabs[app.active].cwd.clone();
+                let text = format_path_for_pty(&p, &root, false);
+                app.active_tab().write_input(text.as_bytes())?;
+            }
+        }
+        KeyCode::Enter => {
+            let action = match br.selected() {
+                Some(BrowserEntry::OpenHere) => Some(BrowserAction::OpenHere),
+                Some(BrowserEntry::Parent) => Some(BrowserAction::CdParent),
+                Some(BrowserEntry::Dir(n)) => Some(BrowserAction::CdInto(n.clone())),
+                Some(BrowserEntry::File(_)) | None => None,
+            };
+            match action {
+                Some(BrowserAction::OpenHere) => {
+                    let cwd = br.cwd.clone();
+                    app.spawn_tab_here(cwd, pty_area.height.max(1), pty_area.width.max(1))?;
+                    app.on_active_changed();
+                    app.save_layout();
+                    return Ok(KeyOutcome::Continue);
+                }
+                Some(BrowserAction::CdParent) => br.cd_parent(),
+                Some(BrowserAction::CdInto(n)) => br.cd_into(&n),
+                None => {}
+            }
+        }
+        _ => {}
+    }
+    Ok(KeyOutcome::Continue)
+}
+
+fn format_path_for_pty(p: &std::path::Path, root: &std::path::Path, absolute: bool) -> String {
+    let s = if absolute {
+        p.to_string_lossy().replace('\\', "/")
+    } else {
+        // Prefer a path relative to the active tab's cwd; fall back to absolute
+        // if `p` is outside `root` for some reason.
+        match p.strip_prefix(root) {
+            Ok(rel) if rel.as_os_str().is_empty() => "./".to_string(),
+            Ok(rel) => {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                format!("./{}", rel_str)
+            }
+            Err(_) => p.to_string_lossy().replace('\\', "/"),
+        }
+    };
+    let needs_quote = s.contains(' ') || s.contains('"') || s.contains('\t');
+    if needs_quote {
+        format!("\"{}\" ", s.replace('"', "\\\""))
+    } else {
+        format!("{} ", s)
+    }
+}
+
+// ===========================================================================
+// Browser key handler
+// ===========================================================================
+fn handle_browser_key(
+    k: crossterm::event::KeyEvent,
+    app: &mut App,
+    pty_area: Rect,
+) -> Result<KeyOutcome> {
+    let Some(br) = app.browser.as_mut() else {
+        app.browser_open = false;
+        return Ok(KeyOutcome::LayoutChanged);
+    };
+    match k.code {
+        KeyCode::Esc | KeyCode::F(6) => {
+            app.browser_open = false;
+            return Ok(KeyOutcome::LayoutChanged);
+        }
+        KeyCode::Up => br.move_up(),
+        KeyCode::Down => br.move_down(),
+        KeyCode::PageUp => br.page_up(),
+        KeyCode::PageDown => br.page_down(),
+        KeyCode::Home => br.home(),
+        KeyCode::End => br.end(),
+        KeyCode::Left | KeyCode::Backspace => br.cd_parent(),
+        KeyCode::Right => {
+            if let Some(name) = match br.selected() {
+                Some(BrowserEntry::Dir(n)) => Some(n.clone()),
+                _ => None,
+            } {
+                br.cd_into(&name);
+            }
+        }
+        KeyCode::Char(' ') => {
+            // Insert absolute path of the selected entry into active claude.
+            // Modal stays open so the user can pick several entries.
+            let path = match br.selected() {
+                Some(BrowserEntry::Dir(n)) | Some(BrowserEntry::File(n)) => {
+                    Some(br.cwd.join(n))
+                }
+                Some(BrowserEntry::OpenHere) => Some(br.cwd.clone()),
+                Some(BrowserEntry::Parent) | None => None,
+            };
+            if let Some(p) = path {
+                let text = format_path_for_pty(&p, &p, true);
+                app.active_tab().write_input(text.as_bytes())?;
+            }
+        }
+        KeyCode::Enter => {
+            // capture what we need, then release the borrow on browser
+            let action = match br.selected() {
+                Some(BrowserEntry::OpenHere) => Some(BrowserAction::OpenHere),
+                Some(BrowserEntry::Parent) => Some(BrowserAction::CdParent),
+                Some(BrowserEntry::Dir(n)) => Some(BrowserAction::CdInto(n.clone())),
+                Some(BrowserEntry::File(_)) | None => None,
+            };
+            match action {
+                Some(BrowserAction::OpenHere) => {
+                    let cwd = br.cwd.clone();
+                    app.browser_open = false;
+                    app.spawn_tab_here(cwd, pty_area.height.max(1), pty_area.width.max(1))?;
+                    app.save_layout();
+                    return Ok(KeyOutcome::LayoutChanged);
+                }
+                Some(BrowserAction::CdParent) => br.cd_parent(),
+                Some(BrowserAction::CdInto(n)) => br.cd_into(&n),
+                None => {}
+            }
+        }
+        _ => {}
+    }
+    Ok(KeyOutcome::Continue)
+}
+
+enum BrowserAction {
+    OpenHere,
+    CdParent,
+    CdInto(String),
+}
+
+// ===========================================================================
+// Browser rendering — modal overlay centered on the screen.
+// ===========================================================================
+fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
+    let Some(br) = app.browser.as_mut() else {
+        return;
+    };
+
+    let w = (full_area.width as u32 * 7 / 10).max(50) as u16;
+    let w = w.min(full_area.width);
+    let h = (full_area.height as u32 * 7 / 10).max(15) as u16;
+    let h = h.min(full_area.height);
+    let x = full_area.x + (full_area.width.saturating_sub(w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+
+    let title = format!(" Browse  ·  {}  ·  Esc close ", browser::path_label(&br.cwd));
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // hint
+            Constraint::Min(1),    // list
+        ])
+        .split(inner);
+
+    let hint = " Enter open · Space → claude (absolute) · → cd · ← parent · F6 close ";
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[0],
+    );
+
+    let list_area = chunks[1];
+    if let Some(err) = &br.error {
+        f.render_widget(
+            Paragraph::new(format!(" ! {} ", err)).style(Style::default().fg(Color::Red)),
+            list_area,
+        );
+        return;
+    }
+
+    let visible = list_area.height as usize;
+    if br.idx < br.scroll {
+        br.scroll = br.idx;
+    } else if br.idx >= br.scroll + visible && visible > 0 {
+        br.scroll = br.idx + 1 - visible;
+    }
+
+    let max_w = list_area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(visible);
+    for i in 0..visible {
+        let e_idx = br.scroll + i;
+        let Some(e) = br.entries.get(e_idx) else {
+            break;
+        };
+        let selected = e_idx == br.idx;
+        let base = match e {
+            BrowserEntry::OpenHere => {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            }
+            BrowserEntry::Parent => Style::default().fg(Color::Yellow),
+            BrowserEntry::Dir(_) => Style::default().fg(Color::Cyan),
+            BrowserEntry::File(_) => Style::default().fg(Color::White),
+        };
+        let style = if selected {
+            base.bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD)
+        } else {
+            base
+        };
+        let label = truncate(&e.label(), max_w.saturating_sub(2));
+        lines.push(Line::from(Span::styled(format!(" {} ", label), style)));
+    }
+    f.render_widget(Paragraph::new(lines), list_area);
+}
+
+// ===========================================================================
+// Palette rendering — modal overlay centered on the screen.
+// ===========================================================================
+fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
+    let w = (full_area.width as u32 * 7 / 10).max(50) as u16;
+    let w = w.min(full_area.width);
+    let h = (full_area.height as u32 * 7 / 10).max(15) as u16;
+    let h = h.min(full_area.height);
+    let x = full_area.x + (full_area.width.saturating_sub(w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Command palette  ·  Esc close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // input
+            Constraint::Length(1), // count
+            Constraint::Min(1),    // list
+        ])
+        .split(inner);
+
+    // Input
+    let input = Line::from(vec![
+        Span::styled(" ▶ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(app.palette_query.clone(), Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(input).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        chunks[0],
+    );
+
+    // Count
+    let count = if app.palette_query.is_empty() {
+        format!(" {} entries ", app.palette_items.len())
+    } else {
+        format!(
+            " {} of {} ",
+            app.palette_filtered.len(),
+            app.palette_items.len()
+        )
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            count,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[1],
+    );
+
+    // List
+    let list_area = chunks[2];
+    if app.palette_filtered.is_empty() {
+        f.render_widget(
+            Paragraph::new(" (no matches) ").style(Style::default().fg(Color::DarkGray)),
+            list_area,
+        );
+        return;
+    }
+
+    let visible = list_area.height as usize;
+    let mut scroll = 0usize;
+    if app.palette_idx >= visible {
+        scroll = app.palette_idx + 1 - visible;
+    }
+
+    let max_w = list_area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(visible);
+    for i in 0..visible {
+        let f_idx = scroll + i;
+        let Some(&item_idx) = app.palette_filtered.get(f_idx) else {
+            break;
+        };
+        let it = &app.palette_items[item_idx];
+        let selected = f_idx == app.palette_idx;
+        let style = if selected {
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let label = truncate(&it.label, max_w.saturating_sub(2));
+        lines.push(Line::from(Span::styled(format!(" {} ", label), style)));
+    }
+    f.render_widget(Paragraph::new(lines), list_area);
+}
+
+// ===========================================================================
+// Bottom terminal pane rendering
+// ===========================================================================
+fn render_bottom_pane(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let title = match app.bottom.as_ref() {
+        Some(bt) => {
+            let focus = if app.bottom_focused { "● focused" } else { "○" };
+            format!(" {} {}  ·  Esc unfocus  ·  Ctrl+` close ", bt.shell_label, focus)
+        }
+        None => " shell ".to_string(),
+    };
+    let border_color = if app.bottom_focused {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(bt) = app.bottom.as_ref() {
+        let p = bt.parser.lock().unwrap();
+        let term = PseudoTerminal::new(p.screen());
+        f.render_widget(term, inner);
+    }
+}
+
+// ===========================================================================
+// Help overlay
+// ===========================================================================
+fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
+    let w = (full_area.width as u32 * 7 / 10).max(60) as u16;
+    let w = w.min(full_area.width);
+    let h = (full_area.height as u32 * 8 / 10).max(20) as u16;
+    let h = h.min(full_area.height);
+    let x = full_area.x + (full_area.width.saturating_sub(w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Help  ·  Esc / F1 close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let pairs: &[(&str, &str)] = &[
+        ("F1",            "Help (this overlay)"),
+        ("F2",            "New tab"),
+        ("F3",            "Sessions sidebar (search + deep-grep)"),
+        ("F4",            "Claude commands sidebar"),
+        ("F5",            "Toggle deep-grep (in Sessions)"),
+        ("F6",            "File explorer (modal, whole filesystem)"),
+        ("F7",            "Toggle mouse mode (off = native select)"),
+        ("F8",            "Close active tab (last tab kept)"),
+        ("F9",            "Command palette (actions + sessions)"),
+        ("F10",           "Quit"),
+        ("F11 / F12",     "Previous / next tab"),
+        ("Ctrl+B",        "Files sidebar (chroot to tab cwd)"),
+        ("Ctrl+`",        "Bottom shell pane (parent shell)"),
+        ("Ctrl+Q",        "Quit"),
+        ("Ctrl+PgUp/PgDn","Prev / next tab"),
+        ("Alt+T/W",       "New / close tab"),
+        ("Alt+1..9",      "Switch to tab N"),
+        ("Alt+←/→",       "Prev / next tab"),
+        ("PgUp/PgDn",     "Scroll PTY history (when claude focused)"),
+        ("Esc (sidebar)", "Unfocus sidebar (keep visible)"),
+        ("Esc (bottom)",  "Unfocus bottom shell (keep visible)"),
+        ("Sidebar Enter", "Files: cd / Open here · Sessions: resume · Commands: submit"),
+        ("Sidebar Space", "Files: insert relative path · Commands: insert (no submit)"),
+        ("F6 Space",      "Insert absolute path"),
+        ("Drag borders",  "Resize sidebar / bottom pane"),
+        ("Shift+drag",    "Native terminal select (for copy)"),
+    ];
+
+    let max_left = pairs.iter().map(|(k, _)| k.len()).max().unwrap_or(10);
+    let lines: Vec<Line> = pairs
+        .iter()
+        .map(|(k, v)| {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:width$}", k, width = max_left),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled(*v, Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ===========================================================================
+// Bottom button bar
+// ===========================================================================
+fn render_button_bar(
+    area: Rect,
+    app: &App,
+    info: Option<&str>,
+) -> (Line<'static>, Vec<ButtonHit>) {
+    // (label, action, is_active). F9 is its own slot — uses a sentinel action
+    // we map below since we don't want a "TogglePalette" Action variant.
+    let buttons: Vec<(&'static str, Action, bool)> = vec![
+        (" F2 new ", Action::NewTab, false),
+        (" F1 help ", Action::ToggleHelp, app.help_open),
+        (" F3 sessions ", Action::ToggleSidebar, app.sidebar_open && app.sidebar_mode == SidebarMode::Sessions),
+        (" F4 cmds ", Action::ToggleCommands, app.sidebar_open && app.sidebar_mode == SidebarMode::Commands),
+        (" ^B files ", Action::ToggleFilesSidebar, app.right_sidebar_open),
+        (" F5 deep ", Action::ToggleDeepGrep, app.deep_grep),
+        (" F6 explorer ", Action::ToggleBrowser, app.browser_open),
+        (" ^` term ", Action::ToggleBottom, app.bottom_open),
+        (" F7 mouse ", Action::ToggleMouse, !app.mouse_on),
+        (" F8 close ", Action::CloseTab, false),
+        (" F9 cmd ", Action::TogglePalette, app.palette_open),
+        (" F11 < ", Action::PrevTab, false),
+        (" F12 > ", Action::NextTab, false),
+        (" quit ", Action::Quit, false),
+    ];
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut hits: Vec<ButtonHit> = Vec::new();
+    let mut x = area.x;
+    let limit = area.x + area.width;
+
+    for (label, action, active) in buttons {
+        let width = label.chars().count() as u16;
+        if x.saturating_add(width) > limit {
+            break;
+        }
+        let style = if active {
+            Style::default()
+                .bg(Color::Green)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(Color::Rgb(80, 80, 80)).fg(Color::White)
+        };
+        spans.push(Span::styled(label, style));
+        // 1-cell gap (DarkGray bg, like the bar)
+        if x.saturating_add(width + 1) <= limit {
+            spans.push(Span::raw(" "));
+        }
+        hits.push(ButtonHit {
+            rect: Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            action,
+        });
+        x = x.saturating_add(width + 1);
+    }
+
+    // Right-aligned info tag, if it fits.
+    if let Some(text) = info {
+        let label = format!(" {} ", text);
+        let w = label.chars().count() as u16;
+        if x.saturating_add(w + 1) <= limit {
+            let pad = limit - x - w;
+            spans.push(Span::raw(" ".repeat(pad as usize)));
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+
+    (Line::from(spans), hits)
+}
+
+// ===========================================================================
+// Sidebar
+// ===========================================================================
+fn render_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    match app.sidebar_mode {
+        SidebarMode::Sessions => render_sessions_sidebar(f, area, app),
+        SidebarMode::Commands => render_commands_sidebar(f, area, app),
+    }
+}
+
+fn render_commands_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let focused = app.sidebar_focused;
+    let focus_tag = if focused { " ● " } else { " ○ " };
+    let border_color = if focused { Color::Yellow } else { Color::DarkGray };
+    let block = Block::default()
+        .title(format!(" Claude commands{} ", focus_tag))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    // search bar
+    let search_line = Line::from(vec![
+        Span::styled(
+            " / ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(app.filter.clone(), Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(search_line).style(Style::default().bg(Color::Rgb(28, 28, 28))),
+        chunks[0],
+    );
+
+    let count_text = format!(
+        " {} of {}  ·  Enter submit · Space insert ",
+        app.commands_filtered.len(),
+        CLAUDE_COMMANDS.len()
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            count_text,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[1],
+    );
+
+    let list_area = chunks[2];
+    if app.commands_filtered.is_empty() {
+        f.render_widget(
+            Paragraph::new(" (no matches) ").style(Style::default().fg(Color::DarkGray)),
+            list_area,
+        );
+        return;
+    }
+
+    let row_h = 2usize;
+    let visible_rows = (list_area.height as usize) / row_h;
+    if app.sidebar_idx < app.sidebar_scroll {
+        app.sidebar_scroll = app.sidebar_idx;
+    } else if app.sidebar_idx >= app.sidebar_scroll + visible_rows && visible_rows > 0 {
+        app.sidebar_scroll = app.sidebar_idx + 1 - visible_rows;
+    }
+
+    let max_w = list_area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_rows * row_h);
+    for i in 0..visible_rows {
+        let f_idx = app.sidebar_scroll + i;
+        let Some(&c_idx) = app.commands_filtered.get(f_idx) else {
+            break;
+        };
+        let (name, desc) = CLAUDE_COMMANDS[c_idx];
+        let selected = f_idx == app.sidebar_idx;
+        let name_style = if selected {
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        };
+        let desc_style = if selected {
+            Style::default().bg(Color::Yellow).fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" {} ", truncate(name, max_w.saturating_sub(2))),
+            name_style,
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(" {} ", truncate(desc, max_w.saturating_sub(2))),
+            desc_style,
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), list_area);
+}
+
+fn handle_commands_sidebar_key(
+    k: crossterm::event::KeyEvent,
+    app: &mut App,
+) -> Result<KeyOutcome> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+
+    match k.code {
+        KeyCode::Esc => {
+            if !app.filter.is_empty() {
+                app.filter.clear();
+                app.apply_commands_filter();
+            } else {
+                app.sidebar_focused = false;
+                return Ok(KeyOutcome::Continue);
+            }
+        }
+        KeyCode::Up => app.sidebar_idx = app.sidebar_idx.saturating_sub(1),
+        KeyCode::Down => {
+            let max = app.commands_filtered.len().saturating_sub(1);
+            app.sidebar_idx = (app.sidebar_idx + 1).min(max);
+        }
+        KeyCode::PageUp => app.sidebar_idx = app.sidebar_idx.saturating_sub(10),
+        KeyCode::PageDown => {
+            let max = app.commands_filtered.len().saturating_sub(1);
+            app.sidebar_idx = (app.sidebar_idx + 10).min(max);
+        }
+        KeyCode::Home => app.sidebar_idx = 0,
+        KeyCode::End => app.sidebar_idx = app.commands_filtered.len().saturating_sub(1),
+        KeyCode::Enter => {
+            if let Some(&c_idx) = app.commands_filtered.get(app.sidebar_idx) {
+                let (name, _) = CLAUDE_COMMANDS[c_idx];
+                let payload = format!("{}\r", name);
+                app.active_tab().write_input(payload.as_bytes())?;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(&c_idx) = app.commands_filtered.get(app.sidebar_idx) {
+                let (name, _) = CLAUDE_COMMANDS[c_idx];
+                let payload = format!("{} ", name);
+                app.active_tab().write_input(payload.as_bytes())?;
+            }
+        }
+        KeyCode::Backspace if app.filter.pop().is_some() => {
+            app.apply_commands_filter();
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            app.filter.push(c);
+            app.apply_commands_filter();
+        }
+        _ => {}
+    }
+    Ok(KeyOutcome::Continue)
+}
+
+fn render_files_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let focused = app.right_sidebar_focused;
+    let Some(br) = app.browser.as_mut() else {
+        return;
+    };
+
+    let focus_tag = if focused { " ● " } else { " ○ " };
+    let title = format!(" Files{}{} ", focus_tag, truncate(&browser::path_label(&br.cwd), 70));
+    let border_color = if focused { Color::Magenta } else { Color::DarkGray };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Enter open · Space → claude · → cd · ← parent · Ctrl+B close ",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[0],
+    );
+
+    let list_area = chunks[1];
+    if let Some(err) = &br.error {
+        f.render_widget(
+            Paragraph::new(format!(" ! {} ", err)).style(Style::default().fg(Color::Red)),
+            list_area,
+        );
+        return;
+    }
+
+    let visible = list_area.height as usize;
+    if br.idx < br.scroll {
+        br.scroll = br.idx;
+    } else if br.idx >= br.scroll + visible && visible > 0 {
+        br.scroll = br.idx + 1 - visible;
+    }
+
+    let max_w = list_area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(visible);
+    for i in 0..visible {
+        let e_idx = br.scroll + i;
+        let Some(e) = br.entries.get(e_idx) else {
+            break;
+        };
+        let selected = e_idx == br.idx;
+        let base = match e {
+            BrowserEntry::OpenHere => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            BrowserEntry::Parent => Style::default().fg(Color::Yellow),
+            BrowserEntry::Dir(_) => Style::default().fg(Color::Cyan),
+            BrowserEntry::File(_) => Style::default().fg(Color::White),
+        };
+        let style = if selected {
+            base.bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            base
+        };
+        let label = truncate(&e.label(), max_w.saturating_sub(2));
+        lines.push(Line::from(Span::styled(format!(" {} ", label), style)));
+    }
+    f.render_widget(Paragraph::new(lines), list_area);
+}
+
+fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let focus_tag = if app.sidebar_focused { " ● " } else { " ○ " };
+    let border_color = if app.sidebar_focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let block = Block::default()
+        .title(format!(" Sessions{} ", focus_tag))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // search input
+            Constraint::Length(1), // count line
+            Constraint::Min(1),    // list
+        ])
+        .split(inner);
+
+    // Search bar
+    let mut search_spans = vec![
+        Span::styled(" / ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(app.filter.clone(), Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+    ];
+    if app.deep_grep {
+        search_spans.push(Span::raw("  "));
+        search_spans.push(Span::styled(
+            "[DEEP]",
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(search_spans))
+            .style(Style::default().bg(Color::Rgb(28, 28, 28))),
+        inner_chunks[0],
+    );
+
+    // Count / status
+    let count_text = if app.filter.is_empty() {
+        format!(" {} sessions ", app.sessions.len())
+    } else if app.deep_grep {
+        let suffix = if app.grep_job.is_some() {
+            " · searching…"
+        } else {
+            " · done"
+        };
+        format!(" {} match{} ", app.grep_hits.len(), suffix)
+    } else {
+        format!(
+            " {} of {} match ",
+            app.filtered.len(),
+            app.sessions.len()
+        )
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            count_text,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        inner_chunks[1],
+    );
+
+    // List
+    let list_area = inner_chunks[2];
+    if app.filtered.is_empty() {
+        let msg = if app.sessions.is_empty() {
+            " no sessions in ~/.claude/projects "
+        } else {
+            " (no matches) "
+        };
+        f.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
+            list_area,
+        );
+        return;
+    }
+
+    let row_h: usize = if app.deep_grep && !app.filter.is_empty() {
+        3
+    } else {
+        2
+    };
+    let visible_rows = (list_area.height as usize) / row_h;
+    if app.sidebar_idx < app.sidebar_scroll {
+        app.sidebar_scroll = app.sidebar_idx;
+    } else if app.sidebar_idx >= app.sidebar_scroll + visible_rows && visible_rows > 0 {
+        app.sidebar_scroll = app.sidebar_idx + 1 - visible_rows;
+    }
+
+    let max_label_width = list_area.width.saturating_sub(2) as usize;
+
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_rows * row_h);
+    for i in 0..visible_rows {
+        let f_idx = app.sidebar_scroll + i;
+        let Some(&real_idx) = app.filtered.get(f_idx) else {
+            break;
+        };
+        let s = &app.sessions[real_idx];
+        let selected = f_idx == app.sidebar_idx;
+        let title_style = if selected {
+            Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let meta_style = if selected {
+            Style::default().bg(Color::White).fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let snippet_style = if selected {
+            Style::default().bg(Color::White).fg(Color::Rgb(60, 100, 60))
+        } else {
+            Style::default().fg(Color::Rgb(120, 180, 120))
+        };
+        let title_text = format!(" {} ", truncate(&s.title, max_label_width.saturating_sub(2)));
+        let branch = s
+            .git_branch
+            .as_deref()
+            .map(|b| format!("·{}", truncate(b, 16)))
+            .unwrap_or_default();
+        let meta_text = format!(
+            " {}  {}{} ",
+            sessions::relative_time(s.updated),
+            sessions::cwd_label(&s.cwd),
+            branch,
+        );
+        let meta_text = truncate(&meta_text, max_label_width);
+        lines.push(Line::from(Span::styled(title_text, title_style)));
+        lines.push(Line::from(Span::styled(meta_text, meta_style)));
+        if row_h == 3 {
+            let snip = app
+                .grep_hits
+                .get(f_idx)
+                .map(|h| truncate(&h.snippet, max_label_width.saturating_sub(2)))
+                .unwrap_or_default();
+            lines.push(Line::from(Span::styled(format!(" {} ", snip), snippet_style)));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), list_area);
+}
+
+// ===========================================================================
+// Action executor — shared by keyboard and mouse paths.
+// ===========================================================================
+fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOutcome> {
+    match action {
+        Action::NewTab => {
+            app.open_tab(pty_area.height.max(1), pty_area.width.max(1))?;
+            app.on_active_changed();
+            app.save_layout();
+            Ok(KeyOutcome::Continue)
+        }
+        Action::CloseTab => {
+            app.close_active();
+            app.on_active_changed();
+            app.save_layout();
+            Ok(KeyOutcome::Continue)
+        }
+        Action::PrevTab => {
+            app.prev_tab();
+            app.on_active_changed();
+            Ok(KeyOutcome::Continue)
+        }
+        Action::NextTab => {
+            app.next_tab();
+            app.on_active_changed();
+            Ok(KeyOutcome::Continue)
+        }
+        Action::SwitchTab(i) => {
+            app.switch(i);
+            app.on_active_changed();
+            Ok(KeyOutcome::Continue)
+        }
+        Action::ToggleSidebar => {
+            app.toggle_sidebar();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::ToggleFilesSidebar => {
+            app.toggle_files_sidebar();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::ToggleDeepGrep => {
+            if !app.sidebar_open {
+                app.toggle_sidebar();
+            }
+            app.toggle_deep_grep();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::ToggleMouse => {
+            app.mouse_on = !app.mouse_on;
+            app.mouse_capture_dirty = true;
+            Ok(KeyOutcome::Continue)
+        }
+        Action::TogglePalette => {
+            app.toggle_palette();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::ToggleBrowser => {
+            app.toggle_browser();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::ToggleBottom => {
+            app.toggle_bottom()?;
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::RestoreLayout => {
+            app.restore_layout(pty_area.height.max(1), pty_area.width.max(1))?;
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::ReloadConfig => {
+            app.reload_config();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::ToggleCommands => {
+            app.toggle_commands_sidebar();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::ToggleHelp => {
+            app.toggle_help();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::Quit => Ok(KeyOutcome::Quit),
+    }
+}
+
+// ===========================================================================
+// Keys
+// ===========================================================================
+fn handle_key(
+    k: crossterm::event::KeyEvent,
+    app: &mut App,
+    pty_area: Rect,
+) -> Result<KeyOutcome> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+
+    if k.code == KeyCode::F(10) || (ctrl && k.code == KeyCode::Char('q')) {
+        return Ok(KeyOutcome::Quit);
+    }
+
+    // F1 — help overlay (global)
+    if k.code == KeyCode::F(1) {
+        return execute_action(Action::ToggleHelp, app, pty_area);
+    }
+
+    // While help overlay is shown, swallow keys (Esc/F1 closes via above)
+    if app.help_open {
+        if k.code == KeyCode::Esc {
+            app.help_open = false;
+            return Ok(KeyOutcome::LayoutChanged);
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
+    // Ctrl+` — toggle bottom terminal (global)
+    if ctrl && matches!(k.code, KeyCode::Char('`') | KeyCode::Char('~')) {
+        return execute_action(Action::ToggleBottom, app, pty_area);
+    }
+
+    // If the bottom pane is focused, route keystrokes there (Esc unfocuses).
+    if app.bottom_open && app.bottom_focused {
+        if k.code == KeyCode::Esc {
+            app.bottom_focused = false;
+            return Ok(KeyOutcome::Continue);
+        }
+        if let Some(bytes) = key_to_bytes(&k) {
+            if let Some(bt) = app.bottom.as_mut() {
+                bt.write_input(&bytes)?;
+            }
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
+    // Command palette has top priority — F9 toggles it.
+    if k.code == KeyCode::F(9) {
+        app.toggle_palette();
+        return Ok(KeyOutcome::LayoutChanged);
+    }
+
+    if app.palette_open {
+        return handle_palette_key(k, app, pty_area);
+    }
+
+    if app.browser_open {
+        return handle_browser_key(k, app, pty_area);
+    }
+
+    if k.code == KeyCode::F(3) {
+        return execute_action(Action::ToggleSidebar, app, pty_area);
+    }
+
+    if k.code == KeyCode::F(4) {
+        return execute_action(Action::ToggleCommands, app, pty_area);
+    }
+
+    if k.code == KeyCode::F(6) {
+        return execute_action(Action::ToggleBrowser, app, pty_area);
+    }
+
+    // Ctrl+B — toggle Files sidebar (VSCode-style explorer)
+    if ctrl && matches!(k.code, KeyCode::Char('b') | KeyCode::Char('B')) {
+        return execute_action(Action::ToggleFilesSidebar, app, pty_area);
+    }
+
+    if k.code == KeyCode::F(5) {
+        return execute_action(Action::ToggleDeepGrep, app, pty_area);
+    }
+
+    if k.code == KeyCode::F(7) {
+        return execute_action(Action::ToggleMouse, app, pty_area);
+    }
+
+    // Right files sidebar — only when focused
+    if app.right_sidebar_open && app.right_sidebar_focused {
+        return handle_files_sidebar_key(k, app, pty_area);
+    }
+
+    // Commands-sidebar handling — only when focused
+    if app.sidebar_open && app.sidebar_focused && app.sidebar_mode == SidebarMode::Commands {
+        return handle_commands_sidebar_key(k, app);
+    }
+
+    // Sessions-sidebar handling — only when focused
+    if app.sidebar_open && app.sidebar_focused {
+        match k.code {
+            KeyCode::Esc => {
+                if !app.filter.is_empty() {
+                    app.filter.clear();
+                    app.apply_filter();
+                } else {
+                    app.sidebar_focused = false;
+                    return Ok(KeyOutcome::Continue);
+                }
+            }
+            KeyCode::Up => {
+                app.sidebar_idx = app.sidebar_idx.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = app.filtered.len().saturating_sub(1);
+                app.sidebar_idx = (app.sidebar_idx + 1).min(max);
+            }
+            KeyCode::PageUp => {
+                app.sidebar_idx = app.sidebar_idx.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                let max = app.filtered.len().saturating_sub(1);
+                app.sidebar_idx = (app.sidebar_idx + 10).min(max);
+            }
+            KeyCode::Home => {
+                app.sidebar_idx = 0;
+            }
+            KeyCode::End => {
+                app.sidebar_idx = app.filtered.len().saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                app.open_selected_session(pty_area.height.max(1), pty_area.width.max(1))?;
+                return Ok(KeyOutcome::LayoutChanged);
+            }
+            KeyCode::Backspace if app.filter.pop().is_some() => {
+                app.apply_filter();
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                app.filter.push(c);
+                app.apply_filter();
+            }
+            _ => {}
+        }
+        return Ok(KeyOutcome::Continue);
+    }
+
+    // PTY-focused
+
+    // Host scrollback
+    match k.code {
+        KeyCode::PageUp if !ctrl && !shift => {
+            app.active_tab().scroll_up();
+            return Ok(KeyOutcome::Continue);
+        }
+        KeyCode::PageDown if !ctrl && !shift => {
+            app.active_tab().scroll_down();
+            return Ok(KeyOutcome::Continue);
+        }
+        _ => {}
+    }
+
+    // Tab management
+    match k.code {
+        KeyCode::F(2) => return execute_action(Action::NewTab, app, pty_area),
+        KeyCode::F(8) => return execute_action(Action::CloseTab, app, pty_area),
+        KeyCode::F(11) => return execute_action(Action::PrevTab, app, pty_area),
+        KeyCode::F(12) => return execute_action(Action::NextTab, app, pty_area),
+        KeyCode::PageUp if ctrl => return execute_action(Action::PrevTab, app, pty_area),
+        KeyCode::PageDown if ctrl => return execute_action(Action::NextTab, app, pty_area),
+        _ => {}
+    }
+
+    if alt {
+        match k.code {
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                return execute_action(Action::NewTab, app, pty_area);
+            }
+            KeyCode::Char('w') | KeyCode::Char('W') => {
+                return execute_action(Action::CloseTab, app, pty_area);
+            }
+            KeyCode::Right => return execute_action(Action::NextTab, app, pty_area),
+            KeyCode::Left => return execute_action(Action::PrevTab, app, pty_area),
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let idx = (c as u8 - b'1') as usize;
+                return execute_action(Action::SwitchTab(idx), app, pty_area);
+            }
+            _ => {}
+        }
+    }
+
+    // Anything else reaches the PTY
+    app.active_tab().scroll_reset();
+    if let Some(bytes) = key_to_bytes(&k) {
+        app.active_tab().write_input(&bytes)?;
+    }
+    Ok(KeyOutcome::Continue)
+}
+
+// ===========================================================================
+// Mouse — returns an Action if the click resolved to one; otherwise None.
+// ===========================================================================
+fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<Action>> {
+    // ---- Resize drag handling ----
+    if matches!(me.kind, MouseEventKind::Up(MouseButton::Left)) {
+        app.resize_drag = ResizeDrag::None;
+    }
+    if app.resize_drag != ResizeDrag::None
+        && matches!(me.kind, MouseEventKind::Drag(MouseButton::Left))
+    {
+        match app.resize_drag {
+            ResizeDrag::Sidebar => {
+                let base = app.sidebar_area.x;
+                let new_w = me.column.saturating_sub(base).saturating_add(1);
+                app.config.layout.sidebar_width = new_w.clamp(20, 120);
+            }
+            ResizeDrag::RightSidebar => {
+                // dragging the left border of right sidebar — width grows as cursor moves left
+                let right_edge = app.right_sidebar_area.x + app.right_sidebar_area.width;
+                let new_w = right_edge.saturating_sub(me.column);
+                app.config.layout.right_sidebar_width = new_w.clamp(20, 120);
+            }
+            ResizeDrag::Bottom => {
+                let new_h = app.body_bottom_y.saturating_sub(me.row);
+                app.config.layout.bottom_height = new_h.clamp(4, 40);
+            }
+            ResizeDrag::None => {}
+        }
+        return Ok(None);
+    }
+    // Start drag on border click
+    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+        // Left sidebar right border = last column of sidebar area
+        if app.sidebar_open && app.sidebar_area.width > 0 {
+            let edge = app.sidebar_area.x + app.sidebar_area.width - 1;
+            if me.column == edge
+                && me.row >= app.sidebar_area.y
+                && me.row < app.sidebar_area.y + app.sidebar_area.height
+            {
+                app.resize_drag = ResizeDrag::Sidebar;
+                return Ok(None);
+            }
+        }
+        // Right sidebar left border = first column of right_sidebar_area
+        if app.right_sidebar_open && app.right_sidebar_area.width > 0 {
+            let edge = app.right_sidebar_area.x;
+            if me.column == edge
+                && me.row >= app.right_sidebar_area.y
+                && me.row < app.right_sidebar_area.y + app.right_sidebar_area.height
+            {
+                app.resize_drag = ResizeDrag::RightSidebar;
+                return Ok(None);
+            }
+        }
+        // Bottom top border = first row of bottom area (the Borders::TOP line)
+        if app.bottom_open
+            && app.bottom_area.height > 0
+            && me.row == app.bottom_area.y
+            && me.column >= app.bottom_area.x
+            && me.column < app.bottom_area.x + app.bottom_area.width
+        {
+            app.resize_drag = ResizeDrag::Bottom;
+            return Ok(None);
+        }
+    }
+
+    // Bottom pane has highest priority — route clicks there, including focus switch.
+    if app.bottom_open
+        && me.row >= app.bottom_area.y
+        && me.row < app.bottom_area.y + app.bottom_area.height
+        && me.column >= app.bottom_area.x
+        && me.column < app.bottom_area.x + app.bottom_area.width
+    {
+        if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.bottom_focused = true;
+        }
+        // Forward mouse events only if the embedded shell actually asked for
+        // mouse reporting. Otherwise the SGR escape sequence would land in
+        // its stdin as garbage.
+        if let Some(bt) = app.bottom.as_mut() {
+            let mouse_requested = {
+                let p = bt.parser.lock().unwrap();
+                !matches!(p.screen().mouse_protocol_mode(), MouseProtocolMode::None)
+            };
+            if mouse_requested {
+                let x = me.column.saturating_sub(app.bottom_area.x) + 1;
+                let y = me.row.saturating_sub(app.bottom_area.y) + 1;
+                if let Some(bytes) = mouse_to_sgr(me, x, y) {
+                    let _ = bt.write_input(&bytes);
+                }
+            }
+        }
+        return Ok(None);
+    }
+
+    // Click outside bottom while it's focused → return focus to main pty.
+    if app.bottom_focused
+        && matches!(me.kind, MouseEventKind::Down(MouseButton::Left))
+    {
+        app.bottom_focused = false;
+    }
+
+    // Tab bar (row 0)
+    if me.row == 0 {
+        if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+            for (i, r) in app.tab_rects.iter().enumerate() {
+                if me.column >= r.x && me.column < r.x + r.width {
+                    return Ok(Some(Action::SwitchTab(i)));
+                }
+            }
+            if let Some(nr) = app.new_tab_rect {
+                if me.column >= nr.x && me.column < nr.x + nr.width {
+                    return Ok(Some(Action::NewTab));
+                }
+            }
+        }
+        return Ok(None);
+    }
+
+    // Button bar (last row): button_hits are absolute rects
+    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+        for b in &app.button_hits {
+            if me.row == b.rect.y
+                && me.column >= b.rect.x
+                && me.column < b.rect.x + b.rect.width
+            {
+                return Ok(Some(b.action));
+            }
+        }
+    }
+
+    // Click inside left sidebar area → focus it.
+    if app.sidebar_open && app.sidebar_area.width > 0 {
+        let in_sidebar = me.row >= app.sidebar_area.y
+            && me.row < app.sidebar_area.y + app.sidebar_area.height
+            && me.column >= app.sidebar_area.x
+            && me.column < app.sidebar_area.x + app.sidebar_area.width;
+        if in_sidebar {
+            if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+                app.sidebar_focused = true;
+                app.right_sidebar_focused = false;
+            }
+            return Ok(None);
+        }
+    }
+
+    // Click inside right sidebar area → focus it.
+    if app.right_sidebar_open && app.right_sidebar_area.width > 0 {
+        let in_right = me.row >= app.right_sidebar_area.y
+            && me.row < app.right_sidebar_area.y + app.right_sidebar_area.height
+            && me.column >= app.right_sidebar_area.x
+            && me.column < app.right_sidebar_area.x + app.right_sidebar_area.width;
+        if in_right {
+            if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+                app.right_sidebar_focused = true;
+                app.sidebar_focused = false;
+            }
+            return Ok(None);
+        }
+    }
+
+    // Outside PTY area? Ignore.
+    if me.row < pty_area.y || me.row >= pty_area.y + pty_area.height {
+        return Ok(None);
+    }
+    if me.column < pty_area.x || me.column >= pty_area.x + pty_area.width {
+        return Ok(None);
+    }
+
+    // Click into main pty area → unfocus all panels.
+    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+        app.sidebar_focused = false;
+        app.right_sidebar_focused = false;
+    }
+
+    let mouse_enabled = app.active_tab().mouse_enabled();
+    if !mouse_enabled {
+        match me.kind {
+            MouseEventKind::ScrollUp => app.active_tab().scroll_up(),
+            MouseEventKind::ScrollDown => app.active_tab().scroll_down(),
+            _ => {}
+        }
+        return Ok(None);
+    }
+
+    let pty_x = me.column.saturating_sub(pty_area.x) + 1;
+    let pty_y = me.row.saturating_sub(pty_area.y) + 1;
+    let bytes = match mouse_to_sgr(me, pty_x, pty_y) {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    app.active_tab().write_input(&bytes)?;
+    Ok(None)
+}
+
+fn mouse_to_sgr(me: MouseEvent, x: u16, y: u16) -> Option<Vec<u8>> {
+    let modifiers = me.modifiers;
+    let shift = modifiers.contains(KeyModifiers::SHIFT) as u8;
+    let alt = modifiers.contains(KeyModifiers::ALT) as u8;
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL) as u8;
+    let mods_bits = (shift * 4) | (alt * 8) | (ctrl * 16);
+
+    let (button, is_release) = match me.kind {
+        MouseEventKind::Down(b) => (button_code(b), false),
+        MouseEventKind::Up(b) => (button_code(b), true),
+        MouseEventKind::Drag(b) => (button_code(b) | 32, false),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+        MouseEventKind::Moved => return None,
+    };
+    let cb = button | mods_bits;
+    let suffix = if is_release { 'm' } else { 'M' };
+    Some(format!("\x1b[<{};{};{}{}", cb, x, y, suffix).into_bytes())
+}
+
+fn button_code(b: MouseButton) -> u8 {
+    match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+// ===========================================================================
+// Key → bytes
+// ===========================================================================
+fn key_to_bytes(k: &crossterm::event::KeyEvent) -> Option<Vec<u8>> {
+    use crossterm::event::KeyCode::*;
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+
+    let mut out = Vec::new();
+    if alt {
+        out.push(0x1b);
+    }
+
+    match k.code {
+        Char(c) => {
+            if ctrl {
+                let upper = c.to_ascii_uppercase();
+                if upper.is_ascii_alphabetic() {
+                    out.push((upper as u8) - b'A' + 1);
+                } else {
+                    let mut tmp = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                }
+            } else {
+                let mut tmp = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+            }
+        }
+        Enter => out.push(b'\r'),
+        Backspace => out.push(0x7f),
+        Tab => out.push(b'\t'),
+        BackTab => out.extend_from_slice(b"\x1b[Z"),
+        Esc => out.push(0x1b),
+        Left => out.extend_from_slice(b"\x1b[D"),
+        Right => out.extend_from_slice(b"\x1b[C"),
+        Up => out.extend_from_slice(b"\x1b[A"),
+        Down => out.extend_from_slice(b"\x1b[B"),
+        Home => out.extend_from_slice(b"\x1b[H"),
+        End => out.extend_from_slice(b"\x1b[F"),
+        PageUp => out.extend_from_slice(b"\x1b[5~"),
+        PageDown => out.extend_from_slice(b"\x1b[6~"),
+        Insert => out.extend_from_slice(b"\x1b[2~"),
+        Delete => out.extend_from_slice(b"\x1b[3~"),
+        F(n) => {
+            let seq: &[u8] = match n {
+                1 => b"\x1bOP",
+                2 => b"\x1bOQ",
+                3 => b"\x1bOR",
+                4 => b"\x1bOS",
+                5 => b"\x1b[15~",
+                6 => b"\x1b[17~",
+                7 => b"\x1b[18~",
+                8 => b"\x1b[19~",
+                9 => b"\x1b[20~",
+                10 => b"\x1b[21~",
+                11 => b"\x1b[23~",
+                12 => b"\x1b[24~",
+                _ => return None,
+            };
+            out.extend_from_slice(seq);
+        }
+        _ => return None,
+    }
+
+    Some(out)
+}
