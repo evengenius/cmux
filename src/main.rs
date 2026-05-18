@@ -53,6 +53,9 @@ use sessions::SessionMeta;
 ///   row last — button bar
 const CHROME_ROWS: u16 = 3;
 const SCROLLBACK_LINES: usize = 10_000;
+/// Max gap between two left-button-down events on the same chat that still
+/// counts as a double-click (close-the-tab gesture).
+const DOUBLE_CLICK_MS: u128 = 500;
 const SCROLL_STEP: usize = 3;
 // Defaults live in config::LayoutConfig::default; overridable via ~/.cmux/config.toml
 
@@ -667,6 +670,9 @@ struct App {
     /// Index of the tab whose mouse-down started a (potential) drag-to-reorder.
     /// `None` while no drag is in progress.
     tab_drag_from: Option<usize>,
+    /// Last left-button-down on a chat tab — used for double-click detection.
+    /// A second click on the same chat within DOUBLE_CLICK_MS closes it.
+    last_chat_click: Option<(Instant, usize)>,
     // commands sidebar
     commands_list: Vec<CommandEntry>,
     commands_filtered: Vec<usize>,
@@ -735,6 +741,7 @@ impl App {
             body_bottom_y: 0,
             resize_drag: ResizeDrag::None,
             tab_drag_from: None,
+            last_chat_click: None,
             commands_list: Vec::new(),
             commands_filtered: Vec::new(),
             help_open: false,
@@ -3671,6 +3678,8 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("Ctrl+F",        "Search active tab's scrollback"),
         ("Shift+F2",      "Rename active tab"),
         ("Drag tab",      "Reorder tabs (mouse down on one, up on another)"),
+        ("Double-click",  "Close that chat (pinned chats refuse)"),
+        ("Right-click",   "Rename that chat (opens the rename modal)"),
         ("Pin via F9",    "Pinned tabs refuse to close (📌 prefix)"),
         ("Ctrl+Q",        "Quit"),
         ("Ctrl+PgUp/PgDn","Prev / next tab"),
@@ -4724,27 +4733,59 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
         return Ok(None);
     }
 
-    // Chat bar (row 1) — clicks switch chat, hold-and-release on a different
-    // chat is the drag-to-reorder gesture (completed in the Up handler above).
+    // Chat bar (row 1):
+    //   left-click           — switch chat (and arm drag-to-reorder)
+    //   left-click × 2 (fast) — close that chat (pin refuses)
+    //   right-click          — open rename modal for that chat
+    //   release on a different chat — swap (handled by the Up handler above)
     if me.row == 1 {
-        if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
-            for &(r, global_idx) in &app.chat_rects {
-                if me.column >= r.x && me.column < r.x + r.width {
-                    app.tab_drag_from = Some(global_idx);
-                    // Convert to chat-bar-local "switch" by using the global
-                    // tab index directly — we don't need SwitchTab's project
-                    // semantics because the click already names which chat
-                    // we want.
-                    app.active = global_idx;
-                    app.on_active_changed();
-                    return Ok(None);
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                for &(r, global_idx) in &app.chat_rects {
+                    if me.column >= r.x && me.column < r.x + r.width {
+                        let now = Instant::now();
+                        let is_double = app
+                            .last_chat_click
+                            .map(|(when, target)| {
+                                target == global_idx
+                                    && now.duration_since(when).as_millis() < DOUBLE_CLICK_MS
+                            })
+                            .unwrap_or(false);
+                        if is_double {
+                            // Consume the click — don't let a third click cascade.
+                            app.last_chat_click = None;
+                            app.active = global_idx;
+                            // close_active refuses pinned tabs and the last
+                            // tab, both of which we just silently ignore.
+                            app.close_active();
+                            app.on_active_changed();
+                            app.save_layout();
+                            return Ok(None);
+                        }
+                        app.last_chat_click = Some((now, global_idx));
+                        app.tab_drag_from = Some(global_idx);
+                        app.active = global_idx;
+                        app.on_active_changed();
+                        return Ok(None);
+                    }
+                }
+                if let Some(nr) = app.new_tab_rect {
+                    if me.column >= nr.x && me.column < nr.x + nr.width {
+                        return Ok(Some(Action::NewTab));
+                    }
                 }
             }
-            if let Some(nr) = app.new_tab_rect {
-                if me.column >= nr.x && me.column < nr.x + nr.width {
-                    return Ok(Some(Action::NewTab));
+            MouseEventKind::Down(MouseButton::Right) => {
+                for &(r, global_idx) in &app.chat_rects {
+                    if me.column >= r.x && me.column < r.x + r.width {
+                        app.active = global_idx;
+                        app.on_active_changed();
+                        app.open_rename();
+                        return Ok(None);
+                    }
                 }
             }
+            _ => {}
         }
         return Ok(None);
     }
