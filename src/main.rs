@@ -520,7 +520,7 @@ impl ChatTab {
     /// Lock order (parser → last_activity) matches the reader thread.
     fn compute_state(&self, now: Instant, permission_patterns: &[String]) -> TabState {
         let text = {
-            let p = self.parser.lock().unwrap();
+            let p = self.parser.lock().unwrap_or_else(|p| p.into_inner());
             p.screen().contents().to_lowercase()
         };
         // permission prompts beat freshness — even if there's new output,
@@ -528,7 +528,7 @@ impl ChatTab {
         if permission_patterns.iter().any(|pat| text.contains(pat)) {
             return TabState::AwaitingPermission;
         }
-        let last = *self.last_activity.lock().unwrap();
+        let last = *self.last_activity.lock().unwrap_or_else(|p| p.into_inner());
         if now.duration_since(last).as_millis() < STREAMING_QUIET_MS {
             return TabState::Streaming;
         }
@@ -548,13 +548,13 @@ impl ChatTab {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        self.parser.lock().unwrap().set_size(rows, cols);
+        self.parser.lock().unwrap_or_else(|p| p.into_inner()).set_size(rows, cols);
         self.dirty.store(true, Ordering::Release);
         Ok(())
     }
 
     fn scroll_up(&self) {
-        let mut p = self.parser.lock().unwrap();
+        let mut p = self.parser.lock().unwrap_or_else(|p| p.into_inner());
         let cur = p.screen().scrollback();
         let next = (cur + SCROLL_STEP).min(self.scrollback_max);
         p.set_scrollback(next);
@@ -562,7 +562,7 @@ impl ChatTab {
     }
 
     fn scroll_down(&self) {
-        let mut p = self.parser.lock().unwrap();
+        let mut p = self.parser.lock().unwrap_or_else(|p| p.into_inner());
         let cur = p.screen().scrollback();
         let next = cur.saturating_sub(SCROLL_STEP);
         p.set_scrollback(next);
@@ -570,7 +570,7 @@ impl ChatTab {
     }
 
     fn scroll_reset(&self) {
-        let mut p = self.parser.lock().unwrap();
+        let mut p = self.parser.lock().unwrap_or_else(|p| p.into_inner());
         if p.screen().scrollback() != 0 {
             p.set_scrollback(0);
             self.dirty.store(true, Ordering::Release);
@@ -586,7 +586,7 @@ impl ChatTab {
     }
 
     fn mouse_enabled(&self) -> bool {
-        let p = self.parser.lock().unwrap();
+        let p = self.parser.lock().unwrap_or_else(|p| p.into_inner());
         !matches!(p.screen().mouse_protocol_mode(), MouseProtocolMode::None)
     }
 }
@@ -694,7 +694,7 @@ impl BottomTerminal {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        self.parser.lock().unwrap().set_size(rows, cols);
+        self.parser.lock().unwrap_or_else(|p| p.into_inner()).set_size(rows, cols);
         self.dirty.store(true, Ordering::Release);
         Ok(())
     }
@@ -2880,7 +2880,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                     render_files_sidebar(f, sb, app);
                 }
 
-                let p = app.tabs[app.active].parser.lock().unwrap();
+                let p = app.tabs[app.active].parser.lock().unwrap_or_else(|p| p.into_inner());
                 let term = PseudoTerminal::new(p.screen());
                 f.render_widget(term, pty_area);
 
@@ -4714,7 +4714,7 @@ fn render_bottom_pane(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     f.render_widget(block, area);
 
     if let Some(bt) = app.bottom.as_ref() {
-        let p = bt.parser.lock().unwrap();
+        let p = bt.parser.lock().unwrap_or_else(|p| p.into_inner());
         let term = PseudoTerminal::new(p.screen());
         f.render_widget(term, inner);
     }
@@ -5895,7 +5895,7 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
         // its stdin as garbage.
         if let Some(bt) = app.bottom.as_mut() {
             let mouse_requested = {
-                let p = bt.parser.lock().unwrap();
+                let p = bt.parser.lock().unwrap_or_else(|p| p.into_inner());
                 !matches!(p.screen().mouse_protocol_mode(), MouseProtocolMode::None)
             };
             if mouse_requested {
@@ -6165,7 +6165,7 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
         let row_in_pty = me.row.saturating_sub(pty_area.y);
         let col_in_pty = me.column.saturating_sub(pty_area.x);
         let url = {
-            let p = app.active_tab().parser.lock().unwrap();
+            let p = app.active_tab().parser.lock().unwrap_or_else(|p| p.into_inner());
             url_at(p.screen(), row_in_pty, col_in_pty)
         };
         if let Some(u) = url {
