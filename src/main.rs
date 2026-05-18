@@ -15,7 +15,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -277,11 +277,12 @@ struct ChatTab {
     /// Plain-text mirror of the PTY output, fed alongside the vt100 parser.
     /// Used by the Ctrl+F scrollback search.
     text_buffer: Arc<Mutex<ScrollbackText>>,
-    /// Newlines seen on this tab's PTY since the user last focused it. The
-    /// reader thread increments this; `on_active_changed` resets the newly
-    /// active tab's counter to zero. Rendered in the tab bar as a `[N]` badge
-    /// on non-active tabs with unread > 0.
-    unread_lines: Arc<AtomicUsize>,
+    /// Completed claude turns the user hasn't seen yet — incremented on every
+    /// Streaming → Idle transition that happens while the tab isn't active,
+    /// reset on focus. Rendered as a `[N]` badge in the chat bar. This is a
+    /// better signal than a raw byte/line count: a streaming tab can produce
+    /// thousands of bytes within a single reply, but only one "completion".
+    unread_replies: usize,
     /// User-pinned: F8 / Alt+W refuse to close, drag-to-reorder still works.
     /// Persisted in `SavedTab`.
     pinned: bool,
@@ -356,14 +357,11 @@ impl ChatTab {
         let dirty = Arc::new(AtomicBool::new(true));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let text_buffer = Arc::new(Mutex::new(ScrollbackText::new()));
-        let unread_lines = Arc::new(AtomicUsize::new(0));
-
         let mut reader = pair.master.try_clone_reader()?;
         let parser_for_reader = parser.clone();
         let dirty_for_reader = dirty.clone();
         let activity_for_reader = last_activity.clone();
         let text_for_reader = text_buffer.clone();
-        let unread_for_reader = unread_lines.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -375,10 +373,6 @@ impl ChatTab {
                         }
                         if let Ok(mut t) = text_for_reader.lock() {
                             t.feed(&buf[..n]);
-                        }
-                        let nls = buf[..n].iter().filter(|&&b| b == b'\n').count();
-                        if nls > 0 {
-                            unread_for_reader.fetch_add(nls, Ordering::Relaxed);
                         }
                         dirty_for_reader.store(true, Ordering::Release);
                         if let Ok(mut t) = activity_for_reader.lock() {
@@ -404,7 +398,7 @@ impl ChatTab {
             writer,
             child,
             text_buffer,
-            unread_lines,
+            unread_replies: 0,
             pinned: false,
             notified_awaiting: false,
         })
@@ -1042,9 +1036,9 @@ impl App {
         if self.right_sidebar_open {
             self.ensure_browser_for_active_tab();
         }
-        // User has eyes on this tab — clear its unread badge.
-        if let Some(tab) = self.tabs.get(self.active) {
-            tab.unread_lines.store(0, Ordering::Relaxed);
+        // User has eyes on this tab — clear its unread-replies badge.
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.unread_replies = 0;
         }
         self.follow_bottom_to_active();
         // Search is scoped to a single tab — close it on switch so the user
@@ -1876,12 +1870,21 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
             .iter()
             .map(|t| t.compute_state(now, patterns))
             .collect();
-        // Edge-trigger notifications: per-tab flag flips when state crosses
-        // into AwaitingPermission, clears when it leaves.
+        // Per-tab state transitions: drive notifications AND increment the
+        // unread-replies badge on Streaming → Idle for non-active tabs.
         let bell = app.config.notify.bell;
         let toast = app.config.notify.toast;
         let mut fired_bell = false;
-        for (tab, &state) in app.tabs.iter_mut().zip(states.iter()) {
+        let active_idx = app.active;
+        for (i, &state) in states.iter().enumerate() {
+            let prev = app.last_states.get(i).copied().unwrap_or(TabState::Idle);
+            let tab = &mut app.tabs[i];
+            // A Streaming → Idle edge marks "claude finished a turn". Bump
+            // the unread counter only for backgrounded tabs — the user is
+            // already looking at the active one.
+            if prev == TabState::Streaming && state == TabState::Idle && i != active_idx {
+                tab.unread_replies = tab.unread_replies.saturating_add(1);
+            }
             match state {
                 TabState::AwaitingPermission if !tab.notified_awaiting => {
                     tab.notified_awaiting = true;
@@ -2275,15 +2278,11 @@ fn render_chat_bar(
         };
 
         let is_active = global_idx == active_global;
-        let unread = if is_active {
-            0
-        } else {
-            t.unread_lines.load(Ordering::Relaxed)
-        };
+        let unread = if is_active { 0 } else { t.unread_replies };
         let badge = if unread == 0 {
             None
-        } else if unread > 999 {
-            Some(" [999+] ".to_string())
+        } else if unread > 99 {
+            Some(" [99+] ".to_string())
         } else {
             Some(format!(" [{}] ", unread))
         };
