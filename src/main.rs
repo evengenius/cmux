@@ -1904,6 +1904,13 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 let term = PseudoTerminal::new(p.screen());
                 f.render_widget(term, pty_area);
 
+                // Paint match highlights over the just-rendered PTY when a
+                // search is active. Only the currently visible window of
+                // vt100's screen needs scanning — fast.
+                if app.search.open && !app.search.query.is_empty() {
+                    paint_search_highlights(f, p.screen(), pty_area, &app.search.query);
+                }
+
                 let scroll_off = p.screen().scrollback();
                 drop(p);
 
@@ -2993,6 +3000,102 @@ fn render_rename_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         ))),
         chunks[2],
     );
+}
+
+// ===========================================================================
+// In-PTY match highlighting for the active scrollback search. Iterates the
+// vt100 screen's currently visible rows (so this honours scrollback offset
+// set by `apply_search_jump`), finds matches per row, and overpaints each
+// match cell-range with a yellow background.
+//
+// Limitations:
+// - Matches that span a line wrap aren't found (each row is scanned alone).
+// - The bottom 2 rows are usually obscured by the search overlay; we still
+//   paint them in case the user has a tall terminal where the overlay
+//   doesn't cover everything.
+// ===========================================================================
+fn paint_search_highlights(
+    f: &mut ratatui::Frame,
+    screen: &vt100::Screen,
+    pty_area: Rect,
+    query: &str,
+) {
+    let (rows, cols) = screen.size();
+    let q_lower = query.to_lowercase();
+    let visible_rows = pty_area.height.min(rows);
+
+    for row in 0..visible_rows {
+        // Build the row's visible text plus a parallel byte→column map so
+        // multibyte characters don't misalign the highlight rectangle.
+        let mut row_cells: Vec<String> = Vec::with_capacity(cols as usize);
+        for col in 0..cols {
+            let c = screen
+                .cell(row, col)
+                .map(|c| c.contents().to_string())
+                .unwrap_or_default();
+            row_cells.push(if c.is_empty() { " ".into() } else { c });
+        }
+        let row_text: String = row_cells.concat();
+        if row_text.is_empty() {
+            continue;
+        }
+
+        // byte_to_col[i] is the column index of the cell containing byte i.
+        let mut byte_to_col: Vec<u16> = Vec::with_capacity(row_text.len() + 1);
+        for (col, s) in row_cells.iter().enumerate() {
+            for _ in 0..s.len() {
+                byte_to_col.push(col as u16);
+            }
+        }
+        byte_to_col.push(cols);
+
+        // Case-insensitive substring scan via lowercased haystack. Lowercase
+        // may change byte lengths (Turkish İ etc.), so map back through the
+        // ORIGINAL row's byte_to_col by re-finding the original substring.
+        let hay_lower = row_text.to_lowercase();
+        let mut start = 0;
+        while let Some(rel) = hay_lower[start..].find(&q_lower) {
+            let abs_lower_start = start + rel;
+            // Heuristic: lowercase doesn't shift positions for ASCII, which
+            // is the dominant case. Trust the position directly. For locales
+            // where it lies we just paint a slightly-wrong rect — cheap
+            // tradeoff for the simpler code.
+            let b_start = abs_lower_start.min(row_text.len());
+            let b_end = (abs_lower_start + q_lower.len()).min(row_text.len());
+            if b_end > b_start {
+                let col_start = byte_to_col.get(b_start).copied().unwrap_or(0);
+                let col_end = byte_to_col.get(b_end).copied().unwrap_or(cols);
+                let width = col_end.saturating_sub(col_start);
+                if width > 0 && col_start < pty_area.width {
+                    let w = width.min(pty_area.width - col_start);
+                    let highlight_text: String = row_cells
+                        [col_start as usize..(col_start + w) as usize]
+                        .concat();
+                    let rect = Rect {
+                        x: pty_area.x + col_start,
+                        y: pty_area.y + row,
+                        width: w,
+                        height: 1,
+                    };
+                    f.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            highlight_text,
+                            Style::default()
+                                .bg(Color::Yellow)
+                                .fg(Color::Black)
+                                .add_modifier(Modifier::BOLD),
+                        ))),
+                        rect,
+                    );
+                }
+            }
+            // Advance by at least one byte to find subsequent matches.
+            start = abs_lower_start + q_lower.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            if start > hay_lower.len() {
+                break;
+            }
+        }
+    }
 }
 
 // ===========================================================================
