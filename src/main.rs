@@ -74,6 +74,7 @@ enum Action {
     ToggleSearch,
     RenameActiveTab,
     RestoreLayout,
+    OpenSaveLayoutAs,
     ReloadConfig,
     Quit,
 }
@@ -148,7 +149,9 @@ const STREAMING_QUIET_MS: u128 = 800;
 // ===========================================================================
 enum PaletteKind {
     Action(Action),
-    Session(usize), // index into App.sessions
+    Session(usize),        // index into App.sessions
+    LayoutSwitch(usize),   // index into App.layout_names
+    LayoutDelete(usize),   // index into App.layout_names
 }
 
 struct PaletteItem {
@@ -161,6 +164,8 @@ enum PaletteResult {
     None,
     Run(Action),
     OpenSession(usize),
+    SwitchLayout(usize),
+    DeleteLayout(usize),
 }
 
 // ===========================================================================
@@ -569,6 +574,12 @@ struct App {
     // tab-rename modal (Shift+F2)
     rename_open: bool,
     rename_input: String,
+    // save-layout-as modal (via palette)
+    save_as_open: bool,
+    save_as_input: String,
+    save_as_error: Option<String>,
+    // named layouts in ~/.cmux/layouts/, refreshed on palette open
+    layout_names: Vec<String>,
     // persisted layout (if any was found at startup)
     saved_layout: Option<layout::SavedLayout>,
     // user config
@@ -622,6 +633,10 @@ impl App {
             search: SearchState::default(),
             rename_open: false,
             rename_input: String::new(),
+            save_as_open: false,
+            save_as_input: String::new(),
+            save_as_error: None,
+            layout_names: Vec::new(),
             saved_layout: layout::load(),
             config: config::load(),
         })
@@ -864,6 +879,36 @@ impl App {
         self.save_layout();
     }
 
+    // -- save layout as (palette) ------------------------------------------
+
+    fn open_save_as(&mut self) {
+        self.save_as_input.clear();
+        self.save_as_error = None;
+        self.save_as_open = true;
+    }
+
+    fn close_save_as(&mut self) {
+        self.save_as_open = false;
+        self.save_as_input.clear();
+        self.save_as_error = None;
+    }
+
+    /// Commit the save-as input. Sanitisation in `layout::sanitize_name`
+    /// strips path-unsafe chars; if the result is empty we set an error
+    /// instead of writing nonsense.
+    fn apply_save_as(&mut self) {
+        let raw = self.save_as_input.trim().to_string();
+        let sanitised = layout::sanitize_name(&raw);
+        if sanitised.is_empty() {
+            self.save_as_error = Some("name is empty after sanitising".to_string());
+            return;
+        }
+        match self.save_layout_as(&sanitised) {
+            Ok(()) => self.close_save_as(),
+            Err(e) => self.save_as_error = Some(e.to_string()),
+        }
+    }
+
     // -- scrollback search (Ctrl+F) ----------------------------------------
 
     fn toggle_search(&mut self) {
@@ -1031,6 +1076,7 @@ impl App {
         // Always re-enumerate so the session list in the palette matches
         // what's actually on disk right now.
         self.refresh_sessions();
+        self.layout_names = layout::list_named();
         self.rebuild_palette_items();
         self.palette_query.clear();
         self.palette_idx = 0;
@@ -1085,6 +1131,28 @@ impl App {
                 kind: PaletteKind::Action(Action::RestoreLayout),
             });
         }
+        // Named layouts — save-as plus per-layout switch / delete.
+        push_action(
+            &mut items,
+            "★  Save current layout as…",
+            Action::OpenSaveLayoutAs,
+        );
+        for (i, name) in self.layout_names.iter().enumerate() {
+            let label = format!("⇄  Switch to layout: {}", name);
+            items.push(PaletteItem {
+                label: label.clone(),
+                hay: format!("switch layout {}", name.to_lowercase()),
+                kind: PaletteKind::LayoutSwitch(i),
+            });
+        }
+        for (i, name) in self.layout_names.iter().enumerate() {
+            let label = format!("✕  Delete saved layout: {}", name);
+            items.push(PaletteItem {
+                label: label.clone(),
+                hay: format!("delete layout {}", name.to_lowercase()),
+                kind: PaletteKind::LayoutDelete(i),
+            });
+        }
         push_action(&mut items, "★  Quit", Action::Quit);
 
         for (i, s) in self.sessions.iter().enumerate() {
@@ -1131,6 +1199,8 @@ impl App {
         match self.palette_items[item_idx].kind {
             PaletteKind::Action(a) => PaletteResult::Run(a),
             PaletteKind::Session(s) => PaletteResult::OpenSession(s),
+            PaletteKind::LayoutSwitch(i) => PaletteResult::SwitchLayout(i),
+            PaletteKind::LayoutDelete(i) => PaletteResult::DeleteLayout(i),
         }
     }
 
@@ -1196,63 +1266,32 @@ impl App {
     }
 
     fn save_layout(&self) {
-        // Resolve a session_id for each tab. Resumed tabs already have one;
-        // for fresh tabs we pick the most recently updated jsonl in
-        // ~/.claude/projects whose cwd matches and which was modified after
-        // the tab was opened.
-        let projects_root = sessions::claude_projects_root();
-        let sessions_all = sessions::enumerate(&projects_root);
-
-        let saved_tabs: Vec<layout::SavedTab> = self
-            .tabs
-            .iter()
-            .map(|t| {
-                let resolved_id = match &t.session_id {
-                    Some(id) => Some(id.clone()),
-                    None => sessions_all
-                        .iter()
-                        .find(|s| {
-                            s.cwd == t.cwd
-                                && s.updated
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0)
-                                    >= t.created_at_unix
-                        }) // sessions_all is already sorted by `updated` desc
-                        .map(|s| s.id.clone()),
-                };
-                layout::SavedTab {
-                    cwd: t.cwd.clone(),
-                    session_id: resolved_id,
-                    title: t.title.clone(),
-                    created_at_unix: t.created_at_unix,
-                }
-            })
-            .collect();
-
-        let layout = layout::SavedLayout {
-            version: 1,
-            saved_at_unix: layout::now_unix(),
-            active: self.active,
-            tabs: saved_tabs,
-            sidebar_open: self.sidebar_open,
-            bottom_open: self.bottom_open,
-        };
-        let _ = layout::save(&layout);
+        let snapshot = self.build_saved_layout();
+        let _ = layout::save(&snapshot);
     }
 
     fn restore_layout(&mut self, rows: u16, cols: u16) -> Result<()> {
-        let Some(saved) = self.saved_layout.clone() else {
+        let Some(saved) = self.saved_layout.take() else {
             return Ok(());
         };
+        self.apply_layout(saved, rows, cols)
+    }
+
+    /// Drain current tabs and replace them with the tabs in `saved`. Shared
+    /// by `restore_layout` (unnamed/auto layout) and `switch_to_layout`
+    /// (named layouts from `~/.cmux/layouts/`).
+    fn apply_layout(
+        &mut self,
+        saved: layout::SavedLayout,
+        rows: u16,
+        cols: u16,
+    ) -> Result<()> {
         if saved.tabs.is_empty() {
             return Ok(());
         }
-        // close current tabs
         for mut t in self.tabs.drain(..) {
             t.kill();
         }
-        // spawn restored tabs
         for st in &saved.tabs {
             let tab = match &st.session_id {
                 Some(id) => ChatTab::spawn_resume(
@@ -1283,10 +1322,65 @@ impl App {
             self.bottom = Some(BottomTerminal::spawn(h, 80, shell_override, bottom_cwd)?);
             self.bottom_open = true;
         }
-        // Consume the saved layout so the palette no longer offers Restore.
-        self.saved_layout = None;
-        self.save_layout(); // overwrite with current state
+        self.save_layout(); // overwrite the unnamed/auto layout with current state
         Ok(())
+    }
+
+    /// Snapshot the current layout (same data the auto-save uses) and write
+    /// it under `name` in `~/.cmux/layouts/<name>.json`.
+    fn save_layout_as(&self, name: &str) -> Result<()> {
+        let snapshot = self.build_saved_layout();
+        layout::save_named(name, &snapshot)
+    }
+
+    /// Build the SavedLayout that represents the current state — extracted
+    /// so save_layout (unnamed) and save_layout_as (named) share one truth.
+    fn build_saved_layout(&self) -> layout::SavedLayout {
+        let projects_root = sessions::claude_projects_root();
+        let sessions_all = sessions::enumerate(&projects_root);
+        let saved_tabs: Vec<layout::SavedTab> = self
+            .tabs
+            .iter()
+            .map(|t| {
+                let resolved_id = match &t.session_id {
+                    Some(id) => Some(id.clone()),
+                    None => sessions_all
+                        .iter()
+                        .find(|s| {
+                            s.cwd == t.cwd
+                                && s.updated
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0)
+                                    >= t.created_at_unix
+                        })
+                        .map(|s| s.id.clone()),
+                };
+                layout::SavedTab {
+                    cwd: t.cwd.clone(),
+                    session_id: resolved_id,
+                    title: t.title.clone(),
+                    created_at_unix: t.created_at_unix,
+                }
+            })
+            .collect();
+
+        layout::SavedLayout {
+            version: 1,
+            saved_at_unix: layout::now_unix(),
+            active: self.active,
+            tabs: saved_tabs,
+            sidebar_open: self.sidebar_open,
+            bottom_open: self.bottom_open,
+        }
+    }
+
+    /// Load `name` from disk and apply it. Drains current tabs.
+    fn switch_to_layout(&mut self, name: &str, rows: u16, cols: u16) -> Result<()> {
+        let Some(saved) = layout::load_named(name) else {
+            return Ok(()); // silently no-op if missing
+        };
+        self.apply_layout(saved, rows, cols)
     }
 
     fn toggle_bottom(&mut self) -> Result<()> {
@@ -1626,6 +1720,9 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 if app.rename_open {
                     render_rename_modal(f, f.area(), app);
                 }
+                if app.save_as_open {
+                    render_save_as_modal(f, f.area(), app);
+                }
             })?;
             needs_draw = false;
         }
@@ -1788,6 +1885,42 @@ fn render_tab_bar(
 }
 
 // ===========================================================================
+// Save-layout-as modal key handler
+// ===========================================================================
+fn handle_save_as_key(k: crossterm::event::KeyEvent, app: &mut App) -> Result<KeyOutcome> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+
+    match k.code {
+        KeyCode::Esc => {
+            app.close_save_as();
+            return Ok(KeyOutcome::LayoutChanged);
+        }
+        KeyCode::Enter => {
+            app.apply_save_as();
+            // If apply_save_as succeeded the modal is closed; otherwise it
+            // stays open with `save_as_error` populated.
+            return Ok(KeyOutcome::LayoutChanged);
+        }
+        KeyCode::Backspace if app.save_as_input.pop().is_some() => {
+            app.save_as_error = None;
+        }
+        KeyCode::Char('u') if ctrl => {
+            app.save_as_input.clear();
+            app.save_as_error = None;
+        }
+        KeyCode::Char(c)
+            if !ctrl && !alt && app.save_as_input.chars().count() < 60 =>
+        {
+            app.save_as_input.push(c);
+            app.save_as_error = None;
+        }
+        _ => {}
+    }
+    Ok(KeyOutcome::Continue)
+}
+
+// ===========================================================================
 // Rename-tab modal key handler (Shift+F2)
 // ===========================================================================
 fn handle_rename_key(k: crossterm::event::KeyEvent, app: &mut App) -> Result<KeyOutcome> {
@@ -1907,6 +2040,22 @@ fn handle_palette_key(
                     app.active = app.tabs.len() - 1;
                     app.on_active_changed();
                     app.save_layout();
+                    return Ok(KeyOutcome::LayoutChanged);
+                }
+                PaletteResult::SwitchLayout(i) => {
+                    if let Some(name) = app.layout_names.get(i).cloned() {
+                        app.switch_to_layout(
+                            &name,
+                            pty_area.height.max(1),
+                            pty_area.width.max(1),
+                        )?;
+                    }
+                    return Ok(KeyOutcome::LayoutChanged);
+                }
+                PaletteResult::DeleteLayout(i) => {
+                    if let Some(name) = app.layout_names.get(i).cloned() {
+                        let _ = layout::delete_named(&name);
+                    }
                     return Ok(KeyOutcome::LayoutChanged);
                 }
             }
@@ -2200,6 +2349,93 @@ fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         lines.push(Line::from(Span::styled(format!(" {} ", label), style)));
     }
     f.render_widget(Paragraph::new(lines), list_area);
+}
+
+// ===========================================================================
+// Save-layout-as modal — centered prompt for a layout name.
+// ===========================================================================
+fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
+    let w = 64u16.min(full_area.width.saturating_sub(4));
+    let h = 7u16;
+    if w < 12 || full_area.height < h + 2 {
+        return;
+    }
+    let x = full_area.x + (full_area.width.saturating_sub(w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Save layout as  ·  Enter save · Esc cancel ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {} tabs in current layout ", app.tabs.len()),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[0],
+    );
+
+    let max_visible = (chunks[1].width as usize).saturating_sub(4);
+    let q_display = if app.save_as_input.chars().count() > max_visible {
+        let skip = app.save_as_input.chars().count() - max_visible;
+        app.save_as_input.chars().skip(skip).collect::<String>()
+    } else {
+        app.save_as_input.clone()
+    };
+    let input = Line::from(vec![
+        Span::styled(" ▶ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(q_display, Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(input).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        chunks[1],
+    );
+
+    // Sanitised preview so users see what the on-disk name will look like.
+    let preview = layout::sanitize_name(&app.save_as_input);
+    let preview_line = if preview.is_empty() {
+        Span::styled(" (empty)", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::styled(
+            format!(" → {}.json", preview),
+            Style::default().fg(Color::Green),
+        )
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(preview_line)),
+        chunks[2],
+    );
+
+    let footer = if let Some(err) = &app.save_as_error {
+        Line::from(Span::styled(
+            format!(" ! {}", err),
+            Style::default().fg(Color::Red),
+        ))
+    } else {
+        Line::from(Span::styled(
+            " Ctrl+U clears · `/` `\\` `:` are stripped ",
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    f.render_widget(Paragraph::new(footer), chunks[3]);
 }
 
 // ===========================================================================
@@ -3192,6 +3428,10 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.open_rename();
             Ok(KeyOutcome::LayoutChanged)
         }
+        Action::OpenSaveLayoutAs => {
+            app.open_save_as();
+            Ok(KeyOutcome::LayoutChanged)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -3234,6 +3474,11 @@ fn handle_key(
     // Rename modal eats all other keys while open.
     if app.rename_open {
         return handle_rename_key(k, app);
+    }
+
+    // Save-layout-as modal eats keys while open.
+    if app.save_as_open {
+        return handle_save_as_key(k, app);
     }
 
     // Ctrl+` — toggle bottom terminal (global)
