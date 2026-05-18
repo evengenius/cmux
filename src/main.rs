@@ -2,6 +2,7 @@ mod browser;
 mod config;
 mod grep;
 mod layout;
+mod notify;
 mod sessions;
 mod shell;
 
@@ -169,6 +170,10 @@ struct ChatTab {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
+    /// True while the tab has already fired its AwaitingPermission notification
+    /// for the current "stuck" period. Cleared once state leaves Awaiting so
+    /// the next transition fires again.
+    notified_awaiting: bool,
 }
 
 impl ChatTab {
@@ -265,6 +270,7 @@ impl ChatTab {
             master: pair.master,
             writer,
             child,
+            notified_awaiting: false,
         })
     }
 
@@ -1225,6 +1231,32 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
             .iter()
             .map(|t| t.compute_state(now, patterns))
             .collect();
+        // Edge-trigger notifications: per-tab flag flips when state crosses
+        // into AwaitingPermission, clears when it leaves.
+        let bell = app.config.notify.bell;
+        let toast = app.config.notify.toast;
+        let mut fired_bell = false;
+        for (tab, &state) in app.tabs.iter_mut().zip(states.iter()) {
+            match state {
+                TabState::AwaitingPermission if !tab.notified_awaiting => {
+                    tab.notified_awaiting = true;
+                    if bell && !fired_bell {
+                        notify::bell();
+                        fired_bell = true; // one bell per cycle, even if several tabs flip
+                    }
+                    if toast {
+                        notify::toast(
+                            &format!("{} needs you", tab.title),
+                            "claude is waiting on a permission prompt",
+                        );
+                    }
+                }
+                TabState::Idle | TabState::Streaming => {
+                    tab.notified_awaiting = false;
+                }
+                _ => {}
+            }
+        }
         if states != app.last_states {
             needs_draw = true;
             app.last_states = states;

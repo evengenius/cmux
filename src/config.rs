@@ -12,6 +12,35 @@ pub struct Config {
     pub shell: ShellConfig,
     #[serde(default)]
     pub detect: DetectConfig,
+    #[serde(default)]
+    pub notify: NotifyConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct NotifyConfig {
+    /// Emit a terminal BEL (`\x07`) when a tab transitions into the
+    /// AwaitingPermission state. Most terminals turn this into a flash
+    /// and/or a sound depending on user config.
+    #[serde(default = "default_true")]
+    pub bell: bool,
+    /// Fire a Windows toast (via background PowerShell, no extra deps)
+    /// when a tab transitions into AwaitingPermission. Windows-only;
+    /// silently ignored on other OSes.
+    #[serde(default = "default_true")]
+    pub toast: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            bell: true,
+            toast: true,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -155,6 +184,15 @@ permission_patterns = [
   "approve this",
   "(y/n)",
 ]
+
+[notify]
+# Terminal BEL (\x07) on a tab transitioning into AwaitingPermission.
+# Most terminals translate this into a flash/sound per user config.
+bell = true
+# Windows toast notification on the same transition. Uses a background
+# PowerShell + WinRT call — no extra dependencies. Silently no-op on
+# non-Windows.
+toast = true
 "#;
 
 pub fn ensure_default_written() {

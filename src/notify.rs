@@ -1,0 +1,148 @@
+use std::io::Write;
+
+/// Emit a terminal BEL byte. Most terminals translate this into either a
+/// visual flash or an audible bell depending on user config.
+pub fn bell() {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+}
+
+/// Show a Windows toast notification. No-op on non-Windows platforms.
+/// Fire-and-forget — errors are swallowed because failing to notify must
+/// never disrupt the TUI.
+pub fn toast(title: &str, body: &str) {
+    #[cfg(windows)]
+    {
+        let xml_title = xml_escape(title);
+        let xml_body = xml_escape(body);
+        let script = format!(
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;\
+             [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime] | Out-Null;\
+             $x = New-Object Windows.Data.Xml.Dom.XmlDocument;\
+             $x.LoadXml('<toast><visual><binding template=\"ToastText02\"><text id=\"1\">{}</text><text id=\"2\">{}</text></binding></visual></toast>');\
+             $t = New-Object Windows.UI.Notifications.ToastNotification $x;\
+             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('cmux').Show($t)",
+            xml_title, xml_body,
+        );
+        let encoded = encode_for_powershell(&script);
+        // CREATE_NO_WINDOW so PowerShell doesn't flash a console window.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-EncodedCommand",
+                &encoded,
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (title, body);
+    }
+}
+
+#[cfg(windows)]
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\'' => out.push_str("&apos;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// PowerShell `-EncodedCommand` expects base64 of the UTF-16LE bytes.
+#[cfg(windows)]
+fn encode_for_powershell(script: &str) -> String {
+    let mut bytes: Vec<u8> = Vec::with_capacity(script.len() * 2);
+    for u in script.encode_utf16() {
+        bytes.push((u & 0xff) as u8);
+        bytes.push((u >> 8) as u8);
+    }
+    base64_encode(&bytes)
+}
+
+#[cfg(windows)]
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= input.len() {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n & 0x3f) as usize] as char);
+        i += 3;
+    }
+    match input.len() - i {
+        1 => {
+            let n = (input[i] as u32) << 16;
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_empty() {
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn base64_one_byte() {
+        assert_eq!(base64_encode(b"a"), "YQ==");
+    }
+
+    #[test]
+    fn base64_two_bytes() {
+        assert_eq!(base64_encode(b"ab"), "YWI=");
+    }
+
+    #[test]
+    fn base64_three_bytes() {
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn base64_longer() {
+        assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
+    }
+
+    #[test]
+    fn xml_escape_all() {
+        assert_eq!(xml_escape("a&b<c>d'e\"f"), "a&amp;b&lt;c&gt;d&apos;e&quot;f");
+    }
+}
