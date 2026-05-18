@@ -8,6 +8,7 @@ mod notify;
 mod scrollback_text;
 mod sessions;
 mod shell;
+mod worktree;
 
 use commands::{CommandEntry, CommandSource};
 use scrollback_text::ScrollbackText;
@@ -401,6 +402,11 @@ struct ChatTab {
     /// User-pinned: F8 / Alt+W refuse to close, drag-to-reorder still works.
     /// Persisted in `SavedTab`.
     pinned: bool,
+    /// (repo_root, worktree_path) when this chat was spawned into a fresh
+    /// `git worktree`. `close_active` uses these to call `git worktree
+    /// remove` if config asks for it. `None` for chats spawned in a plain
+    /// cwd (no repo, or auto_worktree off).
+    worktree_owned: Option<(PathBuf, PathBuf)>,
     /// True while the tab has already fired its AwaitingPermission notification
     /// for the current "stuck" period. Cleared once state leaves Awaiting so
     /// the next transition fires again.
@@ -555,6 +561,7 @@ impl ChatTab {
             total_lines,
             scrollback_max: scrollback_cap,
             pending_cwd,
+            worktree_owned: None,
             unread_replies: 0,
             pinned: false,
             notified_awaiting: false,
@@ -998,16 +1005,59 @@ impl App {
         // Spawn the new tab in the active tab's cwd — this is what the
         // user usually means by F2 ("another chat in this project"). Falls
         // back to the launch cwd if there are no tabs (shouldn't happen).
-        let cwd = self
+        let base_cwd = self
             .tabs
             .get(self.active)
             .map(|t| t.cwd.clone())
             .unwrap_or_else(|| self.cwd.clone());
         let scrollback = self.config.layout.scrollback_lines;
-        let tab = ChatTab::spawn(cwd, rows, cols, scrollback)?;
+        let (cwd, worktree_owned) = self.resolve_spawn_cwd(&base_cwd);
+        let mut tab = ChatTab::spawn(cwd, rows, cols, scrollback)?;
+        tab.worktree_owned = worktree_owned;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         Ok(())
+    }
+
+    /// If `[git] auto_worktree = true` and `base` is inside a git repo,
+    /// create a fresh sibling worktree on a new branch and return that path
+    /// plus the (repo_root, worktree_path) bookkeeping so close-time cleanup
+    /// can `git worktree remove` it. Falls back to (base, None) silently on
+    /// any failure — worktrees are a convenience, not a hard requirement.
+    fn resolve_spawn_cwd(
+        &self,
+        base: &Path,
+    ) -> (PathBuf, Option<(PathBuf, PathBuf)>) {
+        if !self.config.git.auto_worktree {
+            return (base.to_path_buf(), None);
+        }
+        let Some(repo) = worktree::repo_root(base) else {
+            return (base.to_path_buf(), None);
+        };
+        let slug = base
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("chat");
+        let branch = worktree::pick_branch(&repo, &self.config.git.branch_prefix, slug);
+        // Worktree dir: <root>/<slug>-<unix>. Always unique enough.
+        let leaf = format!(
+            "{}-{}",
+            slug,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
+        let root = if Path::new(&self.config.git.worktree_root).is_absolute() {
+            PathBuf::from(&self.config.git.worktree_root)
+        } else {
+            repo.join(&self.config.git.worktree_root)
+        };
+        let target = root.join(&leaf);
+        match worktree::create(&repo, &target, &branch) {
+            Ok(p) => (p.clone(), Some((repo, p))),
+            Err(_) => (base.to_path_buf(), None), // log via diagnostics later
+        }
     }
 
     fn close_active(&mut self) -> bool {
@@ -1032,11 +1082,26 @@ impl App {
             self.recently_closed.push_back(snap);
         }
         let mut t = self.tabs.remove(self.active);
+        // Tear down the worktree if cmux created it AND config asks for it.
+        self.maybe_remove_worktree(&t);
         t.kill();
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
         true
+    }
+
+    /// Run `git worktree remove --force` for a closed tab if (a) cmux owned
+    /// the worktree, (b) config asks for removal, and (c) the tab wasn't
+    /// pinned. Errors are swallowed — leftover worktrees can be cleaned by
+    /// `git worktree prune` later.
+    fn maybe_remove_worktree(&self, tab: &ChatTab) {
+        if !self.config.git.remove_on_close || tab.pinned {
+            return;
+        }
+        if let Some((repo, wt)) = &tab.worktree_owned {
+            let _ = worktree::remove(repo, wt);
+        }
     }
 
     /// Pop the most-recently-closed chat and spawn it back. Falls back to
@@ -1402,6 +1467,7 @@ impl App {
         // Kill from the end so earlier indices stay valid.
         for idx in to_close.into_iter().rev() {
             let mut t = self.tabs.remove(idx);
+            self.maybe_remove_worktree(&t);
             t.kill();
             if self.active > idx {
                 self.active -= 1;
@@ -1785,6 +1851,12 @@ impl App {
                     // Drop the tab directly — bypass close_active so it
                     // doesn't push a second (stale, pinned: false) snapshot.
                     let mut t = self.tabs.remove(idx);
+                    // pin protects worktree; we're explicitly removing
+                    // the pin to close, so honour remove_on_close.
+                    let was_pinned = t.pinned;
+                    t.pinned = false; // so maybe_remove_worktree doesn't skip
+                    self.maybe_remove_worktree(&t);
+                    t.pinned = was_pinned;
                     t.kill();
                     if self.active >= self.tabs.len() {
                         self.active = self.tabs.len().saturating_sub(1);
@@ -2303,7 +2375,9 @@ impl App {
 
     fn spawn_tab_here(&mut self, cwd: PathBuf, rows: u16, cols: u16) -> Result<()> {
         let scrollback = self.config.layout.scrollback_lines;
-        let tab = ChatTab::spawn(cwd, rows, cols, scrollback)?;
+        let (resolved, worktree_owned) = self.resolve_spawn_cwd(&cwd);
+        let mut tab = ChatTab::spawn(resolved, rows, cols, scrollback)?;
+        tab.worktree_owned = worktree_owned;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         Ok(())

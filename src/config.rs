@@ -18,6 +18,47 @@ pub struct Config {
     pub theme: ThemeConfig,
     #[serde(default)]
     pub keys: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub git: GitConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GitConfig {
+    /// When true, new chats spawned inside a git repo land in a fresh
+    /// worktree on a new branch instead of the repo root. Falls back to the
+    /// plain cwd if cwd isn't in a git repo or worktree creation fails.
+    #[serde(default)]
+    pub auto_worktree: bool,
+    /// Directory (relative to the repo root, or absolute) where cmux
+    /// creates worktrees.
+    #[serde(default = "default_worktree_root")]
+    pub worktree_root: String,
+    /// Prefix for the branch name on each worktree.
+    #[serde(default = "default_branch_prefix")]
+    pub branch_prefix: String,
+    /// When true, `git worktree remove --force` runs after the chat
+    /// closes (so the working tree doesn't pile up). Pinned chats are
+    /// exempt — pin protects the worktree too.
+    #[serde(default = "default_true")]
+    pub remove_on_close: bool,
+}
+
+fn default_worktree_root() -> String {
+    ".cmux-worktrees".to_string()
+}
+fn default_branch_prefix() -> String {
+    "cmux/".to_string()
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            auto_worktree: false,
+            worktree_root: default_worktree_root(),
+            branch_prefix: default_branch_prefix(),
+            remove_on_close: true,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -260,6 +301,18 @@ osc = false
 # green, magenta, red, blue, white, gray, lightblue, lightgreen,
 # lightmagenta, lightred, lightyellow, lightcyan.
 accent = "cyan"
+
+[git]
+# When true, F2 / F6-OpenHere spawn the new chat into a fresh git worktree
+# branched off HEAD. Falls back silently if cwd isn't in a git repo.
+auto_worktree = false
+# Where worktrees live, relative to the repo root (or absolute).
+worktree_root = ".cmux-worktrees"
+# Branch name prefix. Slug is derived from the chat's project basename.
+branch_prefix = "cmux/"
+# Run `git worktree remove --force` when the chat closes. Pinned chats
+# are exempt — pin protects the worktree from cleanup.
+remove_on_close = true
 
 [keys]
 # Remap actions to custom keys. Format: action_name = key_combo.
