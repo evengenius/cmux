@@ -5116,40 +5116,93 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
     }
 
     // Click inside left sidebar area → focus it.
+    // Wheel over the sidebar also steps through its list.
     if app.sidebar_open && app.sidebar_area.width > 0 {
         let in_sidebar = me.row >= app.sidebar_area.y
             && me.row < app.sidebar_area.y + app.sidebar_area.height
             && me.column >= app.sidebar_area.x
             && me.column < app.sidebar_area.x + app.sidebar_area.width;
         if in_sidebar {
-            if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
-                app.sidebar_focused = true;
-                app.right_sidebar_focused = false;
+            match me.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    app.sidebar_focused = true;
+                    app.right_sidebar_focused = false;
+                }
+                MouseEventKind::ScrollUp => {
+                    app.sidebar_idx = app.sidebar_idx.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    let max = match app.sidebar_mode {
+                        SidebarMode::Sessions => app.filtered.len(),
+                        SidebarMode::Commands => app.commands_filtered.len(),
+                    }
+                    .saturating_sub(1);
+                    app.sidebar_idx = (app.sidebar_idx + 3).min(max);
+                }
+                _ => {}
             }
             return Ok(None);
         }
     }
 
     // Click inside right sidebar area → focus it.
+    // Wheel over the right sidebar moves through the file browser.
     if app.right_sidebar_open && app.right_sidebar_area.width > 0 {
         let in_right = me.row >= app.right_sidebar_area.y
             && me.row < app.right_sidebar_area.y + app.right_sidebar_area.height
             && me.column >= app.right_sidebar_area.x
             && me.column < app.right_sidebar_area.x + app.right_sidebar_area.width;
         if in_right {
-            if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
-                app.right_sidebar_focused = true;
-                app.sidebar_focused = false;
+            match me.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    app.right_sidebar_focused = true;
+                    app.sidebar_focused = false;
+                }
+                MouseEventKind::ScrollUp => {
+                    if let Some(br) = app.browser.as_mut() {
+                        for _ in 0..3 {
+                            br.move_up();
+                        }
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(br) = app.browser.as_mut() {
+                        for _ in 0..3 {
+                            br.move_down();
+                        }
+                    }
+                }
+                _ => {}
             }
             return Ok(None);
         }
     }
 
-    // Outside PTY area? Ignore.
+    // Outside PTY area? Ignore — but the scrollbar column lives at
+    // `pty_area.x + pty_area.width`, so accept wheel events one column to the
+    // right of the PTY too (so hovering the scrollbar still scrolls).
     if me.row < pty_area.y || me.row >= pty_area.y + pty_area.height {
         return Ok(None);
     }
-    if me.column < pty_area.x || me.column >= pty_area.x + pty_area.width {
+    let in_chat_band = me.column >= pty_area.x
+        && me.column <= pty_area.x + pty_area.width; // inclusive — covers the scrollbar column
+    if !in_chat_band {
+        return Ok(None);
+    }
+    // For clicks/drags, the scrollbar column is dead — but a wheel event
+    // anywhere in the band scrolls. Translate the column once for further
+    // checks below.
+    let on_scrollbar = me.column == pty_area.x + pty_area.width;
+    if on_scrollbar {
+        match me.kind {
+            MouseEventKind::ScrollUp => {
+                app.active_tab().scroll_up();
+            }
+            MouseEventKind::ScrollDown => {
+                app.active_tab().scroll_down();
+            }
+            _ => {}
+        }
         return Ok(None);
     }
 
