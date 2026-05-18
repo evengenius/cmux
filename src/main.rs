@@ -7,7 +7,7 @@ mod shell;
 
 use std::{
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -357,6 +357,8 @@ struct BottomTerminal {
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     shell_label: String,
+    /// Last cwd we sent a `cd` for — used to dedupe auto-follow on tab switch.
+    last_cwd_sent: Option<PathBuf>,
 }
 
 impl BottomTerminal {
@@ -364,9 +366,9 @@ impl BottomTerminal {
         rows: u16,
         cols: u16,
         shell_override: Option<(String, Vec<String>)>,
+        cwd: PathBuf,
     ) -> Result<Self> {
         let (exe, args) = shell_override.unwrap_or_else(shell::detect_parent_shell);
-        let cwd = std::env::current_dir()?;
 
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -418,7 +420,21 @@ impl BottomTerminal {
             writer,
             child,
             shell_label: shell::short_name(&exe),
+            last_cwd_sent: Some(cwd),
         })
+    }
+
+    /// Inject a `cd <path>` line into the shell if the path differs from the
+    /// last cd we sent. No-op for unrecognised shells.
+    fn cd_to(&mut self, path: &Path) -> Result<()> {
+        if self.last_cwd_sent.as_deref() == Some(path) {
+            return Ok(());
+        }
+        if let Some(bytes) = shell::cd_command(&self.shell_label, path) {
+            self.write_input(&bytes)?;
+            self.last_cwd_sent = Some(path.to_path_buf());
+        }
+        Ok(())
     }
 
     fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
@@ -730,6 +746,25 @@ impl App {
         if self.right_sidebar_open {
             self.ensure_browser_for_active_tab();
         }
+        self.follow_bottom_to_active();
+    }
+
+    /// If the bottom shell is open and follow-mode is on, `cd` it to the
+    /// active tab's cwd. Skipped when the user is typing in the bottom shell
+    /// (focused) so we don't corrupt their input.
+    fn follow_bottom_to_active(&mut self) {
+        if !self.config.shell.follow_tab_cwd {
+            return;
+        }
+        if !self.bottom_open || self.bottom_focused {
+            return;
+        }
+        let Some(target) = self.tabs.get(self.active).map(|t| t.cwd.clone()) else {
+            return;
+        };
+        if let Some(bt) = self.bottom.as_mut() {
+            let _ = bt.cd_to(&target);
+        }
     }
 
     fn apply_filter(&mut self) {
@@ -1039,7 +1074,12 @@ impl App {
         if self.bottom.is_none() && saved.bottom_open {
             let h = self.config.layout.bottom_height.saturating_sub(1).max(1);
             let shell_override = self.config.shell.override_pair();
-            self.bottom = Some(BottomTerminal::spawn(h, 80, shell_override)?);
+            let bottom_cwd = self
+                .tabs
+                .get(self.active)
+                .map(|t| t.cwd.clone())
+                .unwrap_or_else(|| self.cwd.clone());
+            self.bottom = Some(BottomTerminal::spawn(h, 80, shell_override, bottom_cwd)?);
             self.bottom_open = true;
         }
         // Consume the saved layout so the palette no longer offers Restore.
@@ -1058,7 +1098,12 @@ impl App {
             // Bottom pane has one Borders::TOP row of chrome.
             let h = self.config.layout.bottom_height.saturating_sub(1).max(1);
             let shell_override = self.config.shell.override_pair();
-            self.bottom = Some(BottomTerminal::spawn(h, 80, shell_override)?);
+            let bottom_cwd = self
+                .tabs
+                .get(self.active)
+                .map(|t| t.cwd.clone())
+                .unwrap_or_else(|| self.cwd.clone());
+            self.bottom = Some(BottomTerminal::spawn(h, 80, shell_override, bottom_cwd)?);
         }
         self.bottom_open = true;
         self.bottom_focused = true;

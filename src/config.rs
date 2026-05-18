@@ -40,12 +40,29 @@ pub struct BrowserConfig {
     pub show_hidden: bool,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ShellConfig {
     #[serde(default)]
     pub exe: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// When true, the bottom shell `cd`s to the active tab's cwd on tab switch.
+    #[serde(default = "default_follow_tab_cwd")]
+    pub follow_tab_cwd: bool,
+}
+
+fn default_follow_tab_cwd() -> bool {
+    true
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            exe: String::new(),
+            args: Vec::new(),
+            follow_tab_cwd: true,
+        }
+    }
 }
 
 impl ShellConfig {
@@ -96,6 +113,9 @@ show_hidden = false
 #   args = ["-NoLogo"]
 exe = ""
 args = []
+# When true, the bottom shell `cd`s to the active tab's cwd on tab switch
+# (only when the shell isn't focused, so it can't corrupt your typing).
+follow_tab_cwd = true
 "#;
 
 pub fn ensure_default_written() {

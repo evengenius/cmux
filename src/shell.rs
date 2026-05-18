@@ -61,3 +61,30 @@ pub fn short_name(exe: &str) -> String {
         .unwrap_or(exe)
         .to_string()
 }
+
+/// Build a "change directory" command for the given shell. Returns `None` if
+/// the shell is unrecognised (we don't want to inject syntactically wrong
+/// commands into a user's prompt). The path is wrapped in quotes that match
+/// the shell's quoting rules; the trailing `\r` submits the line.
+pub fn cd_command(shell_label: &str, path: &Path) -> Option<Vec<u8>> {
+    let lc = shell_label.to_lowercase();
+    let p = path.to_string_lossy();
+    if p.is_empty() {
+        return None;
+    }
+    let line = match lc.as_str() {
+        "cmd.exe" | "cmd" => {
+            // `/d` lets cd cross drives. Double-quote and escape embedded quotes.
+            format!("cd /d \"{}\"\r", p.replace('"', "\"\""))
+        }
+        "powershell.exe" | "powershell" | "pwsh.exe" | "pwsh" => {
+            // -LiteralPath skips wildcard expansion; single quotes -> escape '.
+            format!("Set-Location -LiteralPath '{}'\r", p.replace('\'', "''"))
+        }
+        "bash.exe" | "bash" | "sh" | "sh.exe" | "zsh" | "zsh.exe" | "fish" | "fish.exe" => {
+            format!("cd '{}'\r", p.replace('\'', "'\\''"))
+        }
+        _ => return None,
+    };
+    Some(line.into_bytes())
+}
