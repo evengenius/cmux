@@ -75,6 +75,7 @@ enum Action {
     RenameActiveTab,
     RestoreLayout,
     OpenSaveLayoutAs,
+    ToggleGlobalSessions,
     ReloadConfig,
     Quit,
 }
@@ -166,6 +167,64 @@ enum PaletteResult {
     OpenSession(usize),
     SwitchLayout(usize),
     DeleteLayout(usize),
+}
+
+// ===========================================================================
+// Global sessions modal — full directory listing grouped by cwd.
+// ===========================================================================
+enum GlobalEntry {
+    /// Section header — printed for the cwd that the following sessions
+    /// share. Not selectable.
+    Header(String),
+    /// Pointer back to `App.sessions[idx]`. Selectable.
+    Session(usize),
+}
+
+#[derive(Default)]
+struct GlobalSessionsState {
+    open: bool,
+    filter: String,
+    entries: Vec<GlobalEntry>,
+    idx: usize,
+    scroll: usize,
+}
+
+impl GlobalSessionsState {
+    fn clear(&mut self) {
+        self.open = false;
+        self.filter.clear();
+        self.entries.clear();
+        self.idx = 0;
+        self.scroll = 0;
+    }
+
+    fn is_selectable(&self, idx: usize) -> bool {
+        matches!(self.entries.get(idx), Some(GlobalEntry::Session(_)))
+    }
+
+    fn step(&mut self, dir: isize) {
+        if self.entries.is_empty() {
+            self.idx = 0;
+            return;
+        }
+        let n = self.entries.len();
+        let mut cur = self.idx as isize;
+        // Step at least once, then keep stepping past headers in the same
+        // direction. Wrap to keep navigation forgiving.
+        for _ in 0..n {
+            cur += dir;
+            if cur < 0 {
+                cur = n as isize - 1;
+            }
+            if cur >= n as isize {
+                cur = 0;
+            }
+            if self.is_selectable(cur as usize) {
+                self.idx = cur as usize;
+                return;
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -571,6 +630,8 @@ struct App {
     help_open: bool,
     // scrollback search (Ctrl+F)
     search: SearchState,
+    // global sessions modal (Shift+F3)
+    global_sessions: GlobalSessionsState,
     // tab-rename modal (Shift+F2)
     rename_open: bool,
     rename_input: String,
@@ -631,6 +692,7 @@ impl App {
             commands_filtered: Vec::new(),
             help_open: false,
             search: SearchState::default(),
+            global_sessions: GlobalSessionsState::default(),
             rename_open: false,
             rename_input: String::new(),
             save_as_open: false,
@@ -844,6 +906,11 @@ impl App {
         if self.search.open {
             self.search.clear();
         }
+        // The F3 list is scoped to the active tab's cwd hierarchy, so the
+        // visible set has to be rebuilt on switch.
+        if self.sidebar_open && self.sidebar_mode == SidebarMode::Sessions {
+            self.apply_filter();
+        }
     }
 
     // -- tab rename (Shift+F2) ---------------------------------------------
@@ -877,6 +944,88 @@ impl App {
         }
         self.close_rename();
         self.save_layout();
+    }
+
+    // -- global sessions modal (Shift+F3) ----------------------------------
+
+    fn toggle_global_sessions(&mut self) {
+        if self.global_sessions.open {
+            self.global_sessions.clear();
+            return;
+        }
+        self.refresh_sessions();
+        self.global_sessions.filter.clear();
+        self.global_sessions.idx = 0;
+        self.global_sessions.scroll = 0;
+        self.rebuild_global_entries();
+        self.global_sessions.open = true;
+        // Land on the first selectable row.
+        if !self.global_sessions.is_selectable(self.global_sessions.idx) {
+            self.global_sessions.step(1);
+        }
+    }
+
+    fn rebuild_global_entries(&mut self) {
+        let q = self.global_sessions.filter.to_lowercase();
+        // Indices of sessions that pass the text filter.
+        let mut idxs: Vec<usize> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                if q.is_empty() {
+                    return Some(i);
+                }
+                let hay = format!(
+                    "{}\n{}\n{}\n{}",
+                    s.title.to_lowercase(),
+                    s.cwd.to_string_lossy().to_lowercase(),
+                    s.git_branch.as_deref().unwrap_or("").to_lowercase(),
+                    s.project_dir.to_lowercase()
+                );
+                if hay.contains(&q) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Stable sort by (cwd as string, updated desc). The original
+        // `self.sessions` is already updated-desc, so a stable sort keyed by
+        // cwd alone yields cwd groups with newest-first inside each group.
+        idxs.sort_by(|&a, &b| {
+            let pa = self.sessions[a].cwd.to_string_lossy();
+            let pb = self.sessions[b].cwd.to_string_lossy();
+            pa.cmp(&pb)
+        });
+
+        let mut entries: Vec<GlobalEntry> = Vec::with_capacity(idxs.len() + 8);
+        let mut last_cwd: Option<String> = None;
+        for i in idxs {
+            let cwd_s = self.sessions[i].cwd.to_string_lossy().to_string();
+            if last_cwd.as_deref() != Some(cwd_s.as_str()) {
+                entries.push(GlobalEntry::Header(cwd_s.clone()));
+                last_cwd = Some(cwd_s);
+            }
+            entries.push(GlobalEntry::Session(i));
+        }
+        self.global_sessions.entries = entries;
+        if self.global_sessions.idx >= self.global_sessions.entries.len() {
+            self.global_sessions.idx = 0;
+        }
+        self.global_sessions.scroll = 0;
+        if !self.global_sessions.entries.is_empty()
+            && !self.global_sessions.is_selectable(self.global_sessions.idx)
+        {
+            self.global_sessions.step(1);
+        }
+    }
+
+    fn global_sessions_selected_session(&self) -> Option<usize> {
+        match self.global_sessions.entries.get(self.global_sessions.idx) {
+            Some(GlobalEntry::Session(i)) => Some(*i),
+            _ => None,
+        }
     }
 
     // -- save layout as (palette) ------------------------------------------
@@ -1009,12 +1158,26 @@ impl App {
         }
     }
 
+    /// Active tab's cwd — the scope root for the F3 sidebar. Sessions whose
+    /// own cwd doesn't sit under this path are hidden so the sidebar reflects
+    /// what's relevant to the project you're currently in. Use Shift+F3
+    /// to see *all* sessions in a separate global view.
+    fn scope_root(&self) -> std::path::PathBuf {
+        self.tabs
+            .get(self.active)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
     fn apply_filter(&mut self) {
         // Cancel any running grep — query or mode may have changed.
         if let Some(job) = self.grep_job.take() {
             job.cancel();
         }
         self.grep_hits.clear();
+
+        let scope = self.scope_root();
+        let in_scope = |s: &SessionMeta| s.cwd.starts_with(&scope);
 
         if self.deep_grep && !self.filter.is_empty() {
             // Deep-grep path: filtered list is populated incrementally by
@@ -1024,34 +1187,36 @@ impl App {
                 .sessions
                 .iter()
                 .enumerate()
+                .filter(|(_, s)| in_scope(s))
                 .map(|(i, s)| (i, s.file_path.clone()))
                 .collect();
             self.grep_job = Some(grep::spawn(targets, self.filter.clone()));
         } else {
             // Metadata-only filter (instant).
             let q = self.filter.to_lowercase();
-            self.filtered = if q.is_empty() {
-                (0..self.sessions.len()).collect()
-            } else {
-                self.sessions
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| {
-                        let hay = format!(
-                            "{}\n{}\n{}\n{}",
-                            s.title.to_lowercase(),
-                            sessions::cwd_label(&s.cwd).to_lowercase(),
-                            s.git_branch.as_deref().unwrap_or("").to_lowercase(),
-                            s.project_dir.to_lowercase()
-                        );
-                        if hay.contains(&q) {
-                            Some(i)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            };
+            self.filtered = self
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| in_scope(s))
+                .filter_map(|(i, s)| {
+                    if q.is_empty() {
+                        return Some(i);
+                    }
+                    let hay = format!(
+                        "{}\n{}\n{}\n{}",
+                        s.title.to_lowercase(),
+                        sessions::cwd_label(&s.cwd).to_lowercase(),
+                        s.git_branch.as_deref().unwrap_or("").to_lowercase(),
+                        s.project_dir.to_lowercase()
+                    );
+                    if hay.contains(&q) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         }
         if self.sidebar_idx >= self.filtered.len() {
             self.sidebar_idx = self.filtered.len().saturating_sub(1);
@@ -1103,6 +1268,11 @@ impl App {
         push_action(&mut items, "★  Previous tab", Action::PrevTab);
         push_action(&mut items, "★  Next tab", Action::NextTab);
         push_action(&mut items, "★  Toggle sessions sidebar", Action::ToggleSidebar);
+        push_action(
+            &mut items,
+            "★  Global sessions (Shift+F3, grouped by dir)",
+            Action::ToggleGlobalSessions,
+        );
         push_action(&mut items, "★  Toggle commands sidebar", Action::ToggleCommands);
         push_action(&mut items, "★  Toggle files sidebar", Action::ToggleFilesSidebar);
         push_action(&mut items, "★  Show help overlay", Action::ToggleHelp);
@@ -1717,6 +1887,9 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 if app.help_open {
                     render_help(f, f.area());
                 }
+                if app.global_sessions.open {
+                    render_global_sessions(f, f.area(), app);
+                }
                 if app.rename_open {
                     render_rename_modal(f, f.area(), app);
                 }
@@ -1882,6 +2055,93 @@ fn render_tab_bar(
     ));
 
     (Line::from(spans), rects, new_rect)
+}
+
+// ===========================================================================
+// Global-sessions modal key handler (Shift+F3)
+// ===========================================================================
+fn handle_global_sessions_key(
+    k: crossterm::event::KeyEvent,
+    app: &mut App,
+    pty_area: Rect,
+) -> Result<KeyOutcome> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+
+    match k.code {
+        KeyCode::Esc => {
+            if !app.global_sessions.filter.is_empty() {
+                app.global_sessions.filter.clear();
+                app.rebuild_global_entries();
+            } else {
+                app.global_sessions.clear();
+                return Ok(KeyOutcome::LayoutChanged);
+            }
+        }
+        KeyCode::Up => app.global_sessions.step(-1),
+        KeyCode::Down => app.global_sessions.step(1),
+        KeyCode::PageUp => {
+            for _ in 0..10 {
+                app.global_sessions.step(-1);
+            }
+        }
+        KeyCode::PageDown => {
+            for _ in 0..10 {
+                app.global_sessions.step(1);
+            }
+        }
+        KeyCode::Home => {
+            app.global_sessions.idx = 0;
+            if !app.global_sessions.is_selectable(0)
+                && !app.global_sessions.entries.is_empty()
+            {
+                app.global_sessions.step(1);
+            }
+        }
+        KeyCode::End => {
+            app.global_sessions.idx = app.global_sessions.entries.len().saturating_sub(1);
+            if !app.global_sessions.is_selectable(app.global_sessions.idx)
+                && !app.global_sessions.entries.is_empty()
+            {
+                app.global_sessions.step(-1);
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(sess_idx) = app.global_sessions_selected_session() {
+                let (cwd, id, title) = {
+                    let s = &app.sessions[sess_idx];
+                    (s.cwd.clone(), s.id.clone(), truncate(&s.title, 24))
+                };
+                let tab = ChatTab::spawn_resume(
+                    cwd,
+                    &id,
+                    title,
+                    pty_area.height.max(1),
+                    pty_area.width.max(1),
+                )?;
+                app.tabs.push(tab);
+                app.active = app.tabs.len() - 1;
+                app.on_active_changed();
+                app.save_layout();
+                app.global_sessions.clear();
+                return Ok(KeyOutcome::LayoutChanged);
+            }
+        }
+        // Ctrl+R refresh — picks up new/closed sessions without closing.
+        KeyCode::Char('r') | KeyCode::Char('R') if ctrl => {
+            app.refresh_sessions();
+            app.rebuild_global_entries();
+        }
+        KeyCode::Backspace if app.global_sessions.filter.pop().is_some() => {
+            app.rebuild_global_entries();
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            app.global_sessions.filter.push(c);
+            app.rebuild_global_entries();
+        }
+        _ => {}
+    }
+    Ok(KeyOutcome::Continue)
 }
 
 // ===========================================================================
@@ -2352,6 +2612,153 @@ fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
 }
 
 // ===========================================================================
+// Global sessions modal — every session grouped by cwd.
+// ===========================================================================
+fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
+    let w = (full_area.width as u32 * 8 / 10).max(60) as u16;
+    let w = w.min(full_area.width);
+    let h = (full_area.height as u32 * 85 / 100).max(15) as u16;
+    let h = h.min(full_area.height);
+    let x = full_area.x + (full_area.width.saturating_sub(w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+
+    let total_sessions = app.sessions.len();
+    let session_count: usize = app
+        .global_sessions
+        .entries
+        .iter()
+        .filter(|e| matches!(e, GlobalEntry::Session(_)))
+        .count();
+    let group_count: usize = app
+        .global_sessions
+        .entries
+        .iter()
+        .filter(|e| matches!(e, GlobalEntry::Header(_)))
+        .count();
+    let title = format!(
+        " Global sessions  ·  {} in {} dirs  ·  Esc close  ·  Ctrl+R refresh ",
+        session_count, group_count
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // search input
+            Constraint::Length(1), // count line
+            Constraint::Min(1),    // list
+        ])
+        .split(inner);
+
+    let max_visible = (chunks[0].width as usize).saturating_sub(4);
+    let q_display = if app.global_sessions.filter.chars().count() > max_visible {
+        let skip = app.global_sessions.filter.chars().count() - max_visible;
+        app.global_sessions.filter.chars().skip(skip).collect::<String>()
+    } else {
+        app.global_sessions.filter.clone()
+    };
+    let input = Line::from(vec![
+        Span::styled(" / ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(q_display, Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(input).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        chunks[0],
+    );
+
+    let count_text = if app.global_sessions.filter.is_empty() {
+        format!(" total: {} sessions ", total_sessions)
+    } else {
+        format!(" {} match in {} dirs ", session_count, group_count)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            count_text,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[1],
+    );
+
+    let list_area = chunks[2];
+    if app.global_sessions.entries.is_empty() {
+        let msg = if total_sessions == 0 {
+            " no sessions in ~/.claude/projects "
+        } else {
+            " (no matches) "
+        };
+        f.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
+            list_area,
+        );
+        return;
+    }
+
+    let visible_rows = list_area.height as usize;
+    if app.global_sessions.idx < app.global_sessions.scroll {
+        app.global_sessions.scroll = app.global_sessions.idx;
+    } else if app.global_sessions.idx >= app.global_sessions.scroll + visible_rows
+        && visible_rows > 0
+    {
+        app.global_sessions.scroll = app.global_sessions.idx + 1 - visible_rows;
+    }
+
+    let max_w = list_area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
+    for i in 0..visible_rows {
+        let entry_idx = app.global_sessions.scroll + i;
+        let Some(entry) = app.global_sessions.entries.get(entry_idx) else {
+            break;
+        };
+        match entry {
+            GlobalEntry::Header(cwd) => {
+                let label = format!(" ── {} ──", truncate(cwd, max_w.saturating_sub(6)));
+                lines.push(Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            GlobalEntry::Session(sess_idx) => {
+                let selected = entry_idx == app.global_sessions.idx;
+                let s = &app.sessions[*sess_idx];
+                let branch = s
+                    .git_branch
+                    .as_deref()
+                    .map(|b| format!("·{}", truncate(b, 16)))
+                    .unwrap_or_default();
+                let row = format!(
+                    "    ⤴  {}  ·  {}{}",
+                    truncate(&s.title, max_w.saturating_sub(28)),
+                    sessions::relative_time(s.updated),
+                    branch,
+                );
+                let style = if selected {
+                    Style::default()
+                        .bg(Color::Cyan)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(Span::styled(row, style)));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines), list_area);
+}
+
+// ===========================================================================
 // Save-layout-as modal — centered prompt for a layout name.
 // ===========================================================================
 fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
@@ -2806,7 +3213,8 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
     let pairs: &[(&str, &str)] = &[
         ("F1",            "Help (this overlay)"),
         ("F2",            "New tab"),
-        ("F3",            "Sessions sidebar (search + deep-grep)"),
+        ("F3",            "Sessions in active tab's cwd hierarchy"),
+        ("Shift+F3",      "Global sessions modal (grouped by dir)"),
         ("F4",            "Claude commands sidebar"),
         ("F5",            "Toggle deep-grep (in Sessions)"),
         ("F6",            "File explorer (modal, whole filesystem)"),
@@ -3198,8 +3606,10 @@ fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     } else {
         Color::DarkGray
     };
+    let scope = app.scope_root();
+    let scope_label = truncate(&sessions::cwd_label(&scope), 28);
     let block = Block::default()
-        .title(format!(" Sessions{} ", focus_tag))
+        .title(format!(" Sessions{}↪ {} ", focus_tag, scope_label))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
@@ -3262,9 +3672,11 @@ fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let list_area = inner_chunks[2];
     if app.filtered.is_empty() {
         let msg = if app.sessions.is_empty() {
-            " no sessions in ~/.claude/projects "
+            " no sessions in ~/.claude/projects ".to_string()
+        } else if app.filter.is_empty() {
+            " no sessions under this tab's cwd — Shift+F3 for global ".to_string()
         } else {
-            " (no matches) "
+            " (no matches) ".to_string()
         };
         f.render_widget(
             Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
@@ -3432,6 +3844,10 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.open_save_as();
             Ok(KeyOutcome::LayoutChanged)
         }
+        Action::ToggleGlobalSessions => {
+            app.toggle_global_sessions();
+            Ok(KeyOutcome::LayoutChanged)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -3479,6 +3895,16 @@ fn handle_key(
     // Save-layout-as modal eats keys while open.
     if app.save_as_open {
         return handle_save_as_key(k, app);
+    }
+
+    // Shift+F3 toggles the global-sessions modal.
+    if shift && k.code == KeyCode::F(3) {
+        return execute_action(Action::ToggleGlobalSessions, app, pty_area);
+    }
+
+    // Global-sessions modal eats keys while open.
+    if app.global_sessions.open {
+        return handle_global_sessions_key(k, app, pty_area);
     }
 
     // Ctrl+` — toggle bottom terminal (global)
