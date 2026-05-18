@@ -47,7 +47,11 @@ use browser::{Entry as BrowserEntry, FileBrowser};
 use grep::{GrepHit, GrepJob};
 use sessions::SessionMeta;
 
-const CHROME_ROWS: u16 = 2;
+/// Total non-PTY rows at the top + bottom of the screen:
+///   row 0 — project bar (one strip per unique cwd among open tabs)
+///   row 1 — chat bar (tabs filtered to the active project)
+///   row last — button bar
+const CHROME_ROWS: u16 = 3;
 const SCROLLBACK_LINES: usize = 10_000;
 const SCROLL_STEP: usize = 3;
 // Defaults live in config::LayoutConfig::default; overridable via ~/.cmux/config.toml
@@ -601,8 +605,13 @@ struct App {
     tabs: Vec<ChatTab>,
     active: usize,
     cwd: PathBuf,
-    tab_rects: Vec<Rect>,
+    /// Mouse-hit map for the chat bar: each entry is `(rect, global tab idx)`.
+    /// Rebuilt every draw; only contains chats of the currently active project.
+    chat_rects: Vec<(Rect, usize)>,
     new_tab_rect: Option<Rect>,
+    /// Mouse-hit map for the project bar: each entry is `(rect, project idx
+    /// into `projects()`)`. Rebuilt every draw.
+    project_rects: Vec<(Rect, usize)>,
     // sessions sidebar
     sessions: Vec<SessionMeta>,
     sidebar_open: bool,
@@ -677,8 +686,9 @@ impl App {
             tabs: vec![tab],
             active: 0,
             cwd,
-            tab_rects: Vec::new(),
+            chat_rects: Vec::new(),
             new_tab_rect: None,
+            project_rects: Vec::new(),
             sessions: Vec::new(),
             sidebar_open: false,
             sidebar_focused: false,
@@ -1902,22 +1912,43 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(1),
-                        Constraint::Min(1),
-                        Constraint::Length(1),
+                        Constraint::Length(1), // 0: project bar
+                        Constraint::Length(1), // 1: chat bar
+                        Constraint::Min(1),    // 2: body (sidebars + pty + bottom)
+                        Constraint::Length(1), // 3: button bar
                     ])
                     .split(f.area());
 
-                let (line, rects, new_rect) =
-                    render_tab_bar(&app.tabs, &app.last_states, app.active, chunks[0]);
-                app.tab_rects = rects;
+                // --- project bar (row 0) ---
+                let projects = app.projects();
+                let active_project_idx = app.active_project_idx();
+                let (proj_line, proj_rects) =
+                    render_project_bar(&projects, active_project_idx, chunks[0]);
+                app.project_rects = proj_rects;
+                f.render_widget(
+                    Paragraph::new(proj_line).style(Style::default().bg(Color::Black)),
+                    chunks[0],
+                );
+
+                // --- chat bar (row 1, filtered to active project's chats) ---
+                let chat_indices = app.chats_in_active_project();
+                let (chat_line, chat_rects, new_rect) = render_chat_bar(
+                    &app.tabs,
+                    &chat_indices,
+                    &app.last_states,
+                    app.active,
+                    chunks[1],
+                );
+                app.chat_rects = chat_rects;
                 app.new_tab_rect = Some(new_rect);
-                let tab_bar = Paragraph::new(line).style(Style::default().bg(Color::Black));
-                f.render_widget(tab_bar, chunks[0]);
+                f.render_widget(
+                    Paragraph::new(chat_line).style(Style::default().bg(Color::Black)),
+                    chunks[1],
+                );
 
                 // Body: split off bottom terminal first (vertical),
                 // then sidebar from what remains (horizontal).
-                let body = chunks[1];
+                let body = chunks[2];
                 let (upper_body, bottom_pane_area) = if app.bottom_open {
                     let h = app
                         .config
@@ -2035,11 +2066,11 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                     render_bottom_pane(f, area, app);
                 }
 
-                let (line, hits) = render_button_bar(chunks[2], app, info_tag.as_deref());
+                let (line, hits) = render_button_bar(chunks[3], app, info_tag.as_deref());
                 app.button_hits = hits;
                 f.render_widget(
                     Paragraph::new(line).style(Style::default().bg(Color::DarkGray)),
-                    chunks[2],
+                    chunks[3],
                 );
 
                 // Scrollback search bar — overlays the bottom 2 rows of the
@@ -2153,20 +2184,79 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
 }
 
 // ===========================================================================
-// Tab bar
+// Project bar (row 0)
 // ===========================================================================
-fn render_tab_bar(
-    tabs: &[ChatTab],
-    states: &[TabState],
-    active: usize,
+fn render_project_bar(
+    projects: &[PathBuf],
+    active_idx: usize,
     area: Rect,
-) -> (Line<'static>, Vec<Rect>, Rect) {
+) -> (Line<'static>, Vec<(Rect, usize)>) {
     let mut spans: Vec<Span> = Vec::new();
-    let mut rects = Vec::with_capacity(tabs.len());
+    let mut rects: Vec<(Rect, usize)> = Vec::with_capacity(projects.len());
+    let mut x = area.x;
+    let limit = area.x + area.width;
+
+    // Hint at the leftmost cell so the row is identifiable.
+    let prefix = " projects: ";
+    spans.push(Span::styled(
+        prefix,
+        Style::default().bg(Color::Black).fg(Color::DarkGray),
+    ));
+    x = x.saturating_add(prefix.chars().count() as u16);
+
+    for (i, p) in projects.iter().enumerate() {
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| p.to_str().unwrap_or(""))
+            .to_string();
+        let label = format!(" {}: {} ", i + 1, truncate(&name, 20));
+        let w = label.chars().count() as u16;
+        if x.saturating_add(w) > limit {
+            break;
+        }
+        let style = if i == active_idx {
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(Color::Rgb(40, 40, 50)).fg(Color::Gray)
+        };
+        spans.push(Span::styled(label, style));
+        spans.push(Span::raw(" "));
+        rects.push((
+            Rect {
+                x,
+                y: area.y,
+                width: w,
+                height: 1,
+            },
+            i,
+        ));
+        x = x.saturating_add(w + 1);
+    }
+
+    (Line::from(spans), rects)
+}
+
+// ===========================================================================
+// Chat bar (row 1) — filtered to the active project's chats.
+// ===========================================================================
+fn render_chat_bar(
+    tabs: &[ChatTab],
+    chat_indices: &[usize],
+    states: &[TabState],
+    active_global: usize,
+    area: Rect,
+) -> (Line<'static>, Vec<(Rect, usize)>, Rect) {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut rects: Vec<(Rect, usize)> = Vec::with_capacity(chat_indices.len());
     let mut x = area.x;
 
-    for (i, t) in tabs.iter().enumerate() {
-        let state = states.get(i).copied().unwrap_or(TabState::Idle);
+    for (display_pos, &global_idx) in chat_indices.iter().enumerate() {
+        let t = &tabs[global_idx];
+        let state = states.get(global_idx).copied().unwrap_or(TabState::Idle);
         let (dot, dot_style) = match state {
             TabState::Idle => (None, None),
             TabState::Streaming => (
@@ -2184,9 +2274,8 @@ fn render_tab_bar(
             ),
         };
 
-        // Show an unread badge only on tabs the user isn't currently on —
-        // the active tab is being looked at, by definition not "unread".
-        let unread = if i == active {
+        let is_active = global_idx == active_global;
+        let unread = if is_active {
             0
         } else {
             t.unread_lines.load(Ordering::Relaxed)
@@ -2200,13 +2289,14 @@ fn render_tab_bar(
         };
 
         let pin_prefix = if t.pinned { "📌 " } else { "" };
-        let label = format!(" {}{}: {} ", pin_prefix, i + 1, t.title);
+        // Per-project chat number (display_pos + 1), not global tab index.
+        let label = format!(" {}{}: {} ", pin_prefix, display_pos + 1, t.title);
         let label_w = label.chars().count() as u16;
         let dot_w = dot.map(|s| s.chars().count() as u16).unwrap_or(0);
         let badge_w = badge.as_ref().map(|s| s.chars().count() as u16).unwrap_or(0);
         let total_w = label_w + dot_w + badge_w;
 
-        let label_style = if i == active {
+        let label_style = if is_active {
             Style::default()
                 .bg(Color::White)
                 .fg(Color::Black)
@@ -2214,11 +2304,10 @@ fn render_tab_bar(
         } else {
             Style::default().bg(Color::DarkGray).fg(Color::Gray)
         };
-        let label_bg = if i == active { Color::White } else { Color::DarkGray };
+        let label_bg = if is_active { Color::White } else { Color::DarkGray };
 
         spans.push(Span::styled(label, label_style));
         if let Some(b) = badge {
-            // Badge stays on the tab's background so the click rect is contiguous.
             spans.push(Span::styled(
                 b,
                 Style::default()
@@ -2228,16 +2317,18 @@ fn render_tab_bar(
             ));
         }
         if let (Some(d), Some(ds)) = (dot, dot_style) {
-            // keep the dot's cell on the tab's background so it reads as part of the tab
             spans.push(Span::styled(d, ds.bg(label_bg)));
         }
         spans.push(Span::raw(" "));
-        rects.push(Rect {
-            x,
-            y: area.y,
-            width: total_w,
-            height: 1,
-        });
+        rects.push((
+            Rect {
+                x,
+                y: area.y,
+                width: total_w,
+                height: 1,
+            },
+            global_idx,
+        ));
         x = x.saturating_add(total_w + 1);
     }
 
@@ -4430,22 +4521,20 @@ fn handle_key(
 // ===========================================================================
 fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<Action>> {
     // ---- Tab drag-to-reorder: complete drag on left-button up over the
-    // tab bar. Handled before the generic Up reset so we can read
+    // chat bar (row 1). Handled before the generic Up reset so we can read
     // `tab_drag_from`.
     if matches!(me.kind, MouseEventKind::Up(MouseButton::Left))
-        && me.row == 0
+        && me.row == 1
         && app.tab_drag_from.is_some()
     {
         let src = app.tab_drag_from.take().unwrap();
-        for (j, r) in app.tab_rects.iter().enumerate() {
+        for &(r, dst_global) in &app.chat_rects {
             if me.column >= r.x && me.column < r.x + r.width {
-                if j != src && j < app.tabs.len() && src < app.tabs.len() {
-                    app.tabs.swap(src, j);
-                    // The dragged tab — wherever it ends up — should remain
-                    // the focused one if the user was already on it.
+                if dst_global != src && dst_global < app.tabs.len() && src < app.tabs.len() {
+                    app.tabs.swap(src, dst_global);
                     if app.active == src {
-                        app.active = j;
-                    } else if app.active == j {
+                        app.active = dst_global;
+                    } else if app.active == dst_global {
                         app.active = src;
                     }
                     app.save_layout();
@@ -4454,7 +4543,6 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
                 break;
             }
         }
-        // Released over the tab bar but not on another tab — drop drag silently.
         return Ok(None);
     }
 
@@ -4559,15 +4647,32 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
         app.bottom_focused = false;
     }
 
-    // Tab bar (row 0)
+    // Project bar (row 0) — click jumps to that project's first chat.
     if me.row == 0 {
         if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
-            for (i, r) in app.tab_rects.iter().enumerate() {
+            for &(r, proj_idx) in &app.project_rects {
                 if me.column >= r.x && me.column < r.x + r.width {
-                    // Down arms a potential drag-to-reorder; the actual swap
-                    // (if any) happens on the matching Up event above.
-                    app.tab_drag_from = Some(i);
-                    return Ok(Some(Action::SwitchTab(i)));
+                    return Ok(Some(Action::SwitchProject(proj_idx)));
+                }
+            }
+        }
+        return Ok(None);
+    }
+
+    // Chat bar (row 1) — clicks switch chat, hold-and-release on a different
+    // chat is the drag-to-reorder gesture (completed in the Up handler above).
+    if me.row == 1 {
+        if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+            for &(r, global_idx) in &app.chat_rects {
+                if me.column >= r.x && me.column < r.x + r.width {
+                    app.tab_drag_from = Some(global_idx);
+                    // Convert to chat-bar-local "switch" by using the global
+                    // tab index directly — we don't need SwitchTab's project
+                    // semantics because the click already names which chat
+                    // we want.
+                    app.active = global_idx;
+                    app.on_active_changed();
+                    return Ok(None);
                 }
             }
             if let Some(nr) = app.new_tab_rect {
