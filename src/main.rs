@@ -76,6 +76,7 @@ enum Action {
     RestoreLayout,
     OpenSaveLayoutAs,
     ToggleGlobalSessions,
+    ToggleActivePin,
     ReloadConfig,
     Quit,
 }
@@ -274,6 +275,9 @@ struct ChatTab {
     /// active tab's counter to zero. Rendered in the tab bar as a `[N]` badge
     /// on non-active tabs with unread > 0.
     unread_lines: Arc<AtomicUsize>,
+    /// User-pinned: F8 / Alt+W refuse to close, drag-to-reorder still works.
+    /// Persisted in `SavedTab`.
+    pinned: bool,
     /// True while the tab has already fired its AwaitingPermission notification
     /// for the current "stuck" period. Cleared once state leaves Awaiting so
     /// the next transition fires again.
@@ -394,6 +398,7 @@ impl ChatTab {
             child,
             text_buffer,
             unread_lines,
+            pinned: false,
             notified_awaiting: false,
         })
     }
@@ -635,6 +640,9 @@ struct App {
     body_bottom_y: u16,
     // mouse drag state
     resize_drag: ResizeDrag,
+    /// Index of the tab whose mouse-down started a (potential) drag-to-reorder.
+    /// `None` while no drag is in progress.
+    tab_drag_from: Option<usize>,
     // commands sidebar
     commands_list: Vec<CommandEntry>,
     commands_filtered: Vec<usize>,
@@ -700,6 +708,7 @@ impl App {
             sidebar_area: Rect::default(),
             body_bottom_y: 0,
             resize_drag: ResizeDrag::None,
+            tab_drag_from: None,
             commands_list: Vec::new(),
             commands_filtered: Vec::new(),
             help_open: false,
@@ -729,6 +738,10 @@ impl App {
 
     fn close_active(&mut self) -> bool {
         if self.tabs.len() <= 1 {
+            return false;
+        }
+        // Pinned tabs refuse to close — unpin via the palette first.
+        if self.tabs.get(self.active).map(|t| t.pinned).unwrap_or(false) {
             return false;
         }
         let mut t = self.tabs.remove(self.active);
@@ -926,6 +939,15 @@ impl App {
         // visible set has to be rebuilt on switch.
         if self.sidebar_open && self.sidebar_mode == SidebarMode::Sessions {
             self.apply_filter();
+        }
+    }
+
+    // -- tab pinning -------------------------------------------------------
+
+    fn toggle_active_pin(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.pinned = !tab.pinned;
+            self.save_layout();
         }
     }
 
@@ -1297,6 +1319,17 @@ impl App {
         push_action(&mut items, "★  Toggle bottom terminal", Action::ToggleBottom);
         push_action(&mut items, "★  Search scrollback (Ctrl+F)", Action::ToggleSearch);
         push_action(&mut items, "★  Rename active tab (Shift+F2)", Action::RenameActiveTab);
+        let pin_label = if self
+            .tabs
+            .get(self.active)
+            .map(|t| t.pinned)
+            .unwrap_or(false)
+        {
+            "★  Unpin active tab"
+        } else {
+            "★  Pin active tab (drag to reorder)"
+        };
+        push_action(&mut items, pin_label, Action::ToggleActivePin);
         push_action(&mut items, "★  Toggle mouse mode", Action::ToggleMouse);
         let cfg_path = config::config_path();
         let cfg_label = format!("★  Reload config ({})", cfg_path.display());
@@ -1479,7 +1512,7 @@ impl App {
             t.kill();
         }
         for st in &saved.tabs {
-            let tab = match &st.session_id {
+            let mut tab = match &st.session_id {
                 Some(id) => ChatTab::spawn_resume(
                     st.cwd.clone(),
                     id,
@@ -1494,6 +1527,7 @@ impl App {
                     cols,
                 )?,
             };
+            tab.pinned = st.pinned;
             self.tabs.push(tab);
         }
         self.active = saved.active.min(self.tabs.len().saturating_sub(1));
@@ -1547,6 +1581,7 @@ impl App {
                     session_id: resolved_id,
                     title: t.title.clone(),
                     created_at_unix: t.created_at_unix,
+                    pinned: t.pinned,
                 }
             })
             .collect();
@@ -2048,7 +2083,8 @@ fn render_tab_bar(
             Some(format!(" [{}] ", unread))
         };
 
-        let label = format!(" {}: {} ", i + 1, t.title);
+        let pin_prefix = if t.pinned { "📌 " } else { "" };
+        let label = format!(" {}{}: {} ", pin_prefix, i + 1, t.title);
         let label_w = label.chars().count() as u16;
         let dot_w = dot.map(|s| s.chars().count() as u16).unwrap_or(0);
         let badge_w = badge.as_ref().map(|s| s.chars().count() as u16).unwrap_or(0);
@@ -3274,6 +3310,8 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("Ctrl+`",        "Bottom shell pane (parent shell)"),
         ("Ctrl+F",        "Search active tab's scrollback"),
         ("Shift+F2",      "Rename active tab"),
+        ("Drag tab",      "Reorder tabs (mouse down on one, up on another)"),
+        ("Pin via F9",    "Pinned tabs refuse to close (📌 prefix)"),
         ("Ctrl+Q",        "Quit"),
         ("Ctrl+PgUp/PgDn","Prev / next tab"),
         ("Alt+T/W",       "New / close tab"),
@@ -3895,6 +3933,10 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.toggle_global_sessions();
             Ok(KeyOutcome::LayoutChanged)
         }
+        Action::ToggleActivePin => {
+            app.toggle_active_pin();
+            Ok(KeyOutcome::LayoutChanged)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -4143,9 +4185,40 @@ fn handle_key(
 // Mouse — returns an Action if the click resolved to one; otherwise None.
 // ===========================================================================
 fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<Action>> {
+    // ---- Tab drag-to-reorder: complete drag on left-button up over the
+    // tab bar. Handled before the generic Up reset so we can read
+    // `tab_drag_from`.
+    if matches!(me.kind, MouseEventKind::Up(MouseButton::Left))
+        && me.row == 0
+        && app.tab_drag_from.is_some()
+    {
+        let src = app.tab_drag_from.take().unwrap();
+        for (j, r) in app.tab_rects.iter().enumerate() {
+            if me.column >= r.x && me.column < r.x + r.width {
+                if j != src && j < app.tabs.len() && src < app.tabs.len() {
+                    app.tabs.swap(src, j);
+                    // The dragged tab — wherever it ends up — should remain
+                    // the focused one if the user was already on it.
+                    if app.active == src {
+                        app.active = j;
+                    } else if app.active == j {
+                        app.active = src;
+                    }
+                    app.save_layout();
+                    return Ok(None);
+                }
+                break;
+            }
+        }
+        // Released over the tab bar but not on another tab — drop drag silently.
+        return Ok(None);
+    }
+
     // ---- Resize drag handling ----
     if matches!(me.kind, MouseEventKind::Up(MouseButton::Left)) {
         app.resize_drag = ResizeDrag::None;
+        // Mouse-up anywhere else cancels an in-flight tab drag.
+        app.tab_drag_from = None;
     }
     if app.resize_drag != ResizeDrag::None
         && matches!(me.kind, MouseEventKind::Drag(MouseButton::Left))
@@ -4247,6 +4320,9 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
         if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
             for (i, r) in app.tab_rects.iter().enumerate() {
                 if me.column >= r.x && me.column < r.x + r.width {
+                    // Down arms a potential drag-to-reorder; the actual swap
+                    // (if any) happens on the matching Up event above.
+                    app.tab_drag_from = Some(i);
                     return Ok(Some(Action::SwitchTab(i)));
                 }
             }

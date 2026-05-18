@@ -23,6 +23,10 @@ pub struct SavedTab {
     /// Tab creation time in UNIX seconds (used to resolve session_id later).
     #[serde(default)]
     pub created_at_unix: u64,
+    /// Pinned tabs can't be closed via F8/Alt+W. Persisted so a pinned tab
+    /// stays pinned across cmux restarts.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 pub fn layout_path() -> PathBuf {
