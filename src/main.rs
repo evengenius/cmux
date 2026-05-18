@@ -141,6 +141,9 @@ enum ResizeDrag {
     Sidebar,
     RightSidebar,
     Bottom,
+    /// Dragging the vertical scrollbar thumb of the active chat. Position is
+    /// computed from the mouse row at every event.
+    Scrollbar,
 }
 
 struct ButtonHit {
@@ -4844,6 +4847,29 @@ fn handle_key(
 // ===========================================================================
 // Mouse — returns an Action if the click resolved to one; otherwise None.
 // ===========================================================================
+/// Map a mouse row over the scrollbar to a vt100 scrollback offset and apply
+/// it to the active tab. Top of the bar ≈ oldest scrollback (max offset),
+/// bottom ≈ live tail (offset 0).
+fn set_scrollback_from_mouse_row(app: &mut App, row: u16, pty_area: Rect) {
+    if pty_area.height == 0 {
+        return;
+    }
+    let raw = row.saturating_sub(pty_area.y) as usize;
+    let height = pty_area.height as usize;
+    let row_in_bar = raw.min(height.saturating_sub(1));
+    let offset = if height <= 1 {
+        0
+    } else {
+        SCROLLBACK_LINES * (height - 1 - row_in_bar) / (height - 1)
+    };
+    let capped = offset.min(SCROLLBACK_LINES);
+    let tab = app.active_tab();
+    if let Ok(mut p) = tab.parser.lock() {
+        p.set_scrollback(capped);
+    }
+    tab.dirty.store(true, Ordering::Release);
+}
+
 fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<Action>> {
     // ---- Tab drag-to-reorder: complete drag on left-button up over the
     // chat bar (row 1). Handled before the generic Up reset so we can read
@@ -4896,6 +4922,9 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
                 let new_h = app.body_bottom_y.saturating_sub(me.row);
                 app.config.layout.bottom_height = new_h.clamp(4, 40);
             }
+            ResizeDrag::Scrollbar => {
+                set_scrollback_from_mouse_row(app, me.row, pty_area);
+            }
             ResizeDrag::None => {}
         }
         return Ok(None);
@@ -4932,6 +4961,17 @@ fn handle_mouse(me: MouseEvent, app: &mut App, pty_area: Rect) -> Result<Option<
             && me.column < app.bottom_area.x + app.bottom_area.width
         {
             app.resize_drag = ResizeDrag::Bottom;
+            return Ok(None);
+        }
+        // Scrollbar column on the right edge of the chat area — click jumps
+        // to that position, drag continues to update scrollback offset.
+        if pty_area.width > 0
+            && me.column == pty_area.x + pty_area.width
+            && me.row >= pty_area.y
+            && me.row < pty_area.y + pty_area.height
+        {
+            app.resize_drag = ResizeDrag::Scrollbar;
+            set_scrollback_from_mouse_row(app, me.row, pty_area);
             return Ok(None);
         }
     }
