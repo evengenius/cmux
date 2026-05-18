@@ -342,10 +342,22 @@ impl ChatTab {
             pixel_height: 0,
         })?;
 
-        let mut argv: Vec<&str> = vec!["/c", "claude.cmd"];
-        argv.extend_from_slice(extra_args);
-        let mut cmd = CommandBuilder::new("cmd.exe");
-        cmd.args(argv);
+        // Windows ships claude as `claude.cmd` and refuses to spawn .cmd
+        // files directly — we go through cmd.exe. Other platforms have a
+        // plain `claude` binary on PATH.
+        let mut cmd = if cfg!(windows) {
+            let mut c = CommandBuilder::new("cmd.exe");
+            let mut argv: Vec<&str> = vec!["/c", "claude.cmd"];
+            argv.extend_from_slice(extra_args);
+            c.args(argv);
+            c
+        } else {
+            let mut c = CommandBuilder::new("claude");
+            for a in extra_args {
+                c.arg(a);
+            }
+            c
+        };
         cmd.cwd(&cwd);
         for (k, v) in std::env::vars() {
             cmd.env(k, v);

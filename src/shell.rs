@@ -23,6 +23,7 @@ fn parent_shell_via_sysinfo() -> Option<(String, Vec<String>)> {
     let name = parent.name().to_string_lossy().to_lowercase();
 
     Some(match name.as_str() {
+        // --- Windows ---
         "powershell.exe" | "powershell" => (
             "powershell.exe".to_string(),
             vec!["-NoLogo".to_string()],
@@ -32,11 +33,16 @@ fn parent_shell_via_sysinfo() -> Option<(String, Vec<String>)> {
             vec!["-NoLogo".to_string()],
         ),
         "cmd.exe" | "cmd" => ("cmd.exe".to_string(), vec![]),
-        "bash.exe" | "bash" => ("bash.exe".to_string(), vec!["-i".to_string()]),
+        "bash.exe" => ("bash.exe".to_string(), vec!["-i".to_string()]),
         "wt.exe" | "windowsterminal.exe" => {
             // Wrapping terminals don't host a shell themselves — fall through.
             return None;
         }
+        // --- Unix ---
+        "bash" => ("bash".to_string(), vec!["-i".to_string()]),
+        "zsh" => ("zsh".to_string(), vec!["-i".to_string()]),
+        "fish" => ("fish".to_string(), vec!["-i".to_string()]),
+        "sh" => ("sh".to_string(), vec!["-i".to_string()]),
         _ => {
             // Unknown parent — also fall through to env-var fallback.
             return None;
@@ -51,7 +57,12 @@ fn default_shell() -> (String, Vec<String>) {
     if let Ok(s) = std::env::var("COMSPEC") {
         return (s, Vec::new());
     }
-    ("cmd.exe".to_string(), Vec::new())
+    // Last-resort defaults differ by OS.
+    if cfg!(windows) {
+        ("cmd.exe".to_string(), Vec::new())
+    } else {
+        ("/bin/sh".to_string(), Vec::new())
+    }
 }
 
 pub fn short_name(exe: &str) -> String {
