@@ -56,6 +56,16 @@ A TUI host for the [Claude Code](https://claude.com/claude-code) CLI. Run many p
 - **OS notifications** on the transition into AwaitingPermission: terminal BEL plus a Windows toast (via `powershell -EncodedCommand` + WinRT — no extra deps). On macOS/Linux the toast is a no-op, BEL still works.
 - AwaitingPermission patterns are editable in config — add your own if claude uses different wording in your locale.
 
+### Parallel workflow
+
+- **Broadcast prompt** (palette → `★ Broadcast prompt to all chats in active project…`) — one typed text reaches every chat in the active project with `\r`. Use cases: "run cargo check across all of them", "commit ready work".
+- **Per-model new tab** (palette → `★ New tab with model: opus / sonnet / haiku`) — spawns a fresh chat with `claude --model <name>`.
+
+### Quality of life
+
+- **Ctrl+Click on a URL** in the PTY view opens it in the OS default handler (`start` / `open` / `xdg-open`). The regex trims trailing sentence punctuation.
+- **Visible scrollbar** on the right edge of the chat with `▲`/`█`/`▼`. Click / drag / wheel-scroll. Red dots on the track mark match positions while Ctrl+F is active.
+
 ### Layout
 
 - **Auto-save** — current state is written to `~/.cmux/layout.json` on every change (chat open/close, pin toggle).
@@ -84,6 +94,22 @@ cargo build --release
 ```
 
 Move/symlink the binary somewhere on your `PATH`, then run `cmux`.
+
+## CLI
+
+```
+cmux [PATH] [--layout NAME] [--resume ID] [--continue]
+cmux -h | --help | -V | --version
+```
+
+| Arg | Effect |
+| --- | --- |
+| `PATH` | Starting cwd for the first chat (default: current directory). |
+| `--layout NAME` | Apply `~/.cmux/layouts/<NAME>.json` on startup. |
+| `--resume ID` | First tab = `claude --resume <id>`. |
+| `--continue` | First tab = `claude --continue` (resume the latest session in this cwd). |
+
+Before entering raw mode, cmux verifies that `claude` (or `claude.cmd` on Windows) is on `PATH`. If missing, you get a clear error instead of a cryptic PTY failure.
 
 ## Keymap
 
@@ -127,6 +153,7 @@ Move/symlink the binary somewhere on your `PATH`, then run `cmux`.
 | --- | --- |
 | `Ctrl+F` | Search active chat's scrollback |
 | `↑` / `↓` or `Enter` | Step through matches |
+| `Alt+R` | Toggle regex mode (sticky across opens) |
 | `Esc` | Close, scrollback → 0 |
 
 ### Environment
@@ -151,9 +178,11 @@ Move/symlink the binary somewhere on your `PATH`, then run `cmux`.
 
 ### Mouse
 
-- Click a project in row 0 → switch to that project's first chat.
-- Click a chat in row 1 → switch active chat.
-- Drag a chat (down → up on a different chat) → swap (within the same project).
+- **Row 0 (projects)**: click → switch project; double-click → close the whole project (asks for confirmation); click `+ project` → file browser anchored at the active cwd for a new chat.
+- **Row 1 (chats)**: click → switch chat; double-click → close chat (pinned → confirmation); right-click → rename; drag (down→up on another chat) → swap within the project.
+- **Chat PTY**: `Ctrl+Click` on a URL opens it in the OS default browser; wheel scrolls scrollback; `Shift+Drag` — native terminal text selection.
+- **Scrollbar (right edge of chat)**: click/drag to set position; wheel scrolls.
+- **Sidebars**: wheel steps through entries; drag the border to resize.
 
 ## Configuration
 
@@ -165,6 +194,7 @@ sidebar_width = 42         # left sidebar (Sessions/Commands)
 right_sidebar_width = 42   # right sidebar (Files)
 bottom_height = 12         # bottom shell pane
 auto_restore = false       # auto-restore ~/.cmux/layout.json on startup
+scrollback_lines = 10000   # PTY scrollback cap; ~100B × cap × open tabs
 
 [browser]
 show_hidden = false        # show .git, .claude, etc.
@@ -190,6 +220,21 @@ permission_patterns = [
 [notify]
 bell = true    # terminal BEL on AwaitingPermission transition
 toast = true   # Windows toast (no-op on other OSes)
+
+[theme]
+# Accent colour used for palette / save-as modal borders, etc.
+# cyan | yellow | green | magenta | red | blue | white | gray | light*
+accent = "cyan"
+
+[keys]
+# Remap nullary actions to custom keys. Format:
+#   action_name = "key_combo"
+# Actions are snake_case versions of internal Action variants.
+# Keys: f1..f12, single chars, ctrl-x, alt-shift-f4, etc.
+# Defaults stay in place — these entries are overrides / additions.
+# Example:
+#   toggle_search = "f4"     # F4 opens search instead of F4=commands
+#   quit          = "ctrl-x" # Ctrl+X quits (in addition to F10/Ctrl+Q)
 ```
 
 ## Layout persistence

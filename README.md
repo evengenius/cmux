@@ -56,6 +56,16 @@ TUI-обёртка для CLI [Claude Code](https://claude.com/claude-code). В�
 - **OS-нотификации** при переходе в AwaitingPermission: терминальный BEL + Windows-toast (через `powershell -EncodedCommand` + WinRT, без доп. зависимостей). На macOS/Linux toast — no-op, BEL работает.
 - Паттерны детектирования AwaitingPermission редактируются в config — добавь свои если у claude другая локаль.
 
+### Параллельная работа
+
+- **Broadcast prompt** (палитра → `★ Broadcast prompt to all chats in active project…`) — один текст шлётся всем чатам активного проекта с `\r`. Сценарии: «запусти cargo check во всех», «закоммить готовое».
+- **Per-model new tab** (палитра → `★ New tab with model: opus / sonnet / haiku`) — спавн нового чата с `claude --model <name>`.
+
+### Удобства
+
+- **Ctrl+Click на URL** в выводе PTY — открывает в дефолтном браузере ОС (`start` / `open` / `xdg-open`). Регекс отсекает финальную пунктуацию.
+- **Видимый скроллбар** справа от чата с `▲`/`█`/`▼`. Клик / drag / колесо. Красные точки на полосе показывают позиции матчей при активном Ctrl+F.
+
 ### Layout
 
 - **Auto-save** — текущее состояние пишется в `~/.cmux/layout.json` на каждое изменение (открытие/закрытие чата, смена pin).
@@ -84,6 +94,22 @@ cargo build --release
 ```
 
 Перенесите/симлинкуйте бинарь куда-нибудь в `PATH`, потом запускайте `cmux`.
+
+## CLI
+
+```
+cmux [PATH] [--layout NAME] [--resume ID] [--continue]
+cmux -h | --help | -V | --version
+```
+
+| Аргумент | Что делает |
+| --- | --- |
+| `PATH` | Стартовая cwd для первого чата (по умолчанию — текущая директория). |
+| `--layout NAME` | Применить named layout `~/.cmux/layouts/<NAME>.json` при старте. |
+| `--resume ID` | Первый таб = `claude --resume <id>`. |
+| `--continue` | Первый таб = `claude --continue` (resume последней сессии в этой cwd). |
+
+Перед запуском raw-mode cmux проверяет наличие `claude` (или `claude.cmd` на Windows) в `PATH`. Если не найден — внятная ошибка вместо непонятного PTY-крэша.
 
 ## Шпаргалка по клавишам
 
@@ -127,6 +153,7 @@ cargo build --release
 | --- | --- |
 | `Ctrl+F` | Поиск по истории активного чата |
 | `↑` / `↓` или `Enter` | Шагать по матчам |
+| `Alt+R` | Toggle regex-режим (sticky — запоминается между открытиями) |
 | `Esc` | Закрыть, скроллбэк → 0 |
 
 ### Окружение
@@ -151,9 +178,11 @@ cargo build --release
 
 ### Мышь
 
-- Клик по проекту в row 0 — переключиться на первый чат проекта.
-- Клик по чату в row 1 — переключить активный чат.
-- Drag чата (down → up на другом чате) — поменять местами (внутри проекта).
+- **Row 0 (проекты)**: клик → переключить проект; двойной клик → закрыть весь проект (с подтверждением); клик по `+ project` → file browser в активной cwd для нового чата.
+- **Row 1 (чаты)**: клик → переключить чат; двойной клик → закрыть чат (pinned → подтверждение); правый клик → переименовать; drag (down→up на другом чате) → swap внутри проекта.
+- **Чат-PTY**: `Ctrl+Click` на URL открывает в браузере; колесо прокручивает scrollback; `Shift+Drag` — нативное выделение текста терминалом.
+- **Scrollbar (правый край чата)**: клик/drag — задать позицию; колесо — прокрутка.
+- **Боковые панели**: колесо шагает по списку, drag-border — изменить ширину/высоту.
 
 ## Конфигурация
 
@@ -165,6 +194,7 @@ sidebar_width = 42         # ширина левой панели (Sessions/Comm
 right_sidebar_width = 42   # ширина правой панели (Files)
 bottom_height = 12         # высота нижней shell-панели
 auto_restore = false       # автовосстановление ~/.cmux/layout.json при старте
+scrollback_lines = 10000   # cap PTY-скроллбэка; ~100B × cap × открытых табов
 
 [browser]
 show_hidden = false        # показывать .git, .claude и т.п.
@@ -190,6 +220,21 @@ permission_patterns = [
 [notify]
 bell = true    # терминальный BEL при переходе в AwaitingPermission
 toast = true   # Windows toast (no-op на других ОС)
+
+[theme]
+# Accent — для рамок палитры/save-as модалов и т.п.
+# cyan | yellow | green | magenta | red | blue | white | gray | light*
+accent = "cyan"
+
+[keys]
+# Переназначение F-ключей и сочетаний на любые Action (nullary). Формат:
+#   action_name = "key_combo"
+# Action: snake_case вариантов внутреннего Action enum.
+# Key: f1..f12, single chars, ctrl-x, alt-shift-f4 и т.п.
+# Дефолтные биндинги остаются — это только override / добавление.
+# Пример:
+#   toggle_search = "f4"     # F4 открывает поиск вместо F4=commands
+#   quit          = "ctrl-x" # Ctrl+X выходит дополнительно к F10/Ctrl+Q
 ```
 
 ## Layout (сохранение и восстановление)
