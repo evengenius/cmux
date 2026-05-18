@@ -72,6 +72,7 @@ enum Action {
     ToggleCommands,
     ToggleHelp,
     ToggleSearch,
+    RenameActiveTab,
     RestoreLayout,
     ReloadConfig,
     Quit,
@@ -217,6 +218,13 @@ impl ChatTab {
             .and_then(|s| s.to_str())
             .unwrap_or("claude")
             .to_string();
+        Self::spawn_inner(cwd, &[], title, None, rows, cols)
+    }
+
+    /// Spawn a fresh (non-resumed) tab with an explicit title. Used by
+    /// layout restore so previously-renamed tabs keep their names instead of
+    /// snapping back to the cwd basename.
+    fn spawn_with_title(cwd: PathBuf, title: String, rows: u16, cols: u16) -> Result<Self> {
         Self::spawn_inner(cwd, &[], title, None, rows, cols)
     }
 
@@ -559,6 +567,9 @@ struct App {
     help_open: bool,
     // scrollback search (Ctrl+F)
     search: SearchState,
+    // tab-rename modal (Shift+F2)
+    rename_open: bool,
+    rename_input: String,
     // persisted layout (if any was found at startup)
     saved_layout: Option<layout::SavedLayout>,
     // user config
@@ -611,6 +622,8 @@ impl App {
             commands_filtered: Vec::new(),
             help_open: false,
             search: SearchState::default(),
+            rename_open: false,
+            rename_input: String::new(),
             saved_layout: layout::load(),
             config: config::load(),
         })
@@ -812,6 +825,39 @@ impl App {
         if self.search.open {
             self.search.clear();
         }
+    }
+
+    // -- tab rename (Shift+F2) ---------------------------------------------
+
+    fn open_rename(&mut self) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            self.rename_input = tab.title.clone();
+            self.rename_open = true;
+        }
+    }
+
+    fn close_rename(&mut self) {
+        self.rename_open = false;
+        self.rename_input.clear();
+    }
+
+    /// Apply the current `rename_input` to the active tab. Empty input is
+    /// treated as "reset to cwd basename" so users can undo a rename.
+    fn apply_rename(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            let new_title = if self.rename_input.trim().is_empty() {
+                tab.cwd
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("claude")
+                    .to_string()
+            } else {
+                self.rename_input.trim().to_string()
+            };
+            tab.title = truncate(&new_title, 60);
+        }
+        self.close_rename();
+        self.save_layout();
     }
 
     // -- scrollback search (Ctrl+F) ----------------------------------------
@@ -1017,6 +1063,7 @@ impl App {
         push_action(&mut items, "★  Open file browser (modal)", Action::ToggleBrowser);
         push_action(&mut items, "★  Toggle bottom terminal", Action::ToggleBottom);
         push_action(&mut items, "★  Search scrollback (Ctrl+F)", Action::ToggleSearch);
+        push_action(&mut items, "★  Rename active tab (Shift+F2)", Action::RenameActiveTab);
         push_action(&mut items, "★  Toggle mouse mode", Action::ToggleMouse);
         let cfg_path = config::config_path();
         let cfg_label = format!("★  Reload config ({})", cfg_path.display());
@@ -1214,7 +1261,12 @@ impl App {
                     rows,
                     cols,
                 )?,
-                None => ChatTab::spawn(st.cwd.clone(), rows, cols)?,
+                None => ChatTab::spawn_with_title(
+                    st.cwd.clone(),
+                    truncate(&st.title, 24),
+                    rows,
+                    cols,
+                )?,
             };
             self.tabs.push(tab);
         }
@@ -1563,6 +1615,9 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 if app.help_open {
                     render_help(f, f.area());
                 }
+                if app.rename_open {
+                    render_rename_modal(f, f.area(), app);
+                }
             })?;
             needs_draw = false;
         }
@@ -1722,6 +1777,35 @@ fn render_tab_bar(
     ));
 
     (Line::from(spans), rects, new_rect)
+}
+
+// ===========================================================================
+// Rename-tab modal key handler (Shift+F2)
+// ===========================================================================
+fn handle_rename_key(k: crossterm::event::KeyEvent, app: &mut App) -> Result<KeyOutcome> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+
+    match k.code {
+        KeyCode::Esc => {
+            app.close_rename();
+            return Ok(KeyOutcome::LayoutChanged);
+        }
+        KeyCode::Enter => {
+            app.apply_rename();
+            return Ok(KeyOutcome::LayoutChanged);
+        }
+        KeyCode::Backspace if app.rename_input.pop().is_some() => {}
+        // Ctrl+U clears the field — handy when you want to reset to default.
+        KeyCode::Char('u') if ctrl => app.rename_input.clear(),
+        KeyCode::Char(c)
+            if !ctrl && !alt && app.rename_input.chars().count() < 60 =>
+        {
+            app.rename_input.push(c);
+        }
+        _ => {}
+    }
+    Ok(KeyOutcome::Continue)
 }
 
 // ===========================================================================
@@ -2111,6 +2195,73 @@ fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
 }
 
 // ===========================================================================
+// Rename-tab modal — small centered prompt.
+// ===========================================================================
+fn render_rename_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
+    let w = 60u16.min(full_area.width.saturating_sub(4));
+    let h = 5u16;
+    if w < 10 || full_area.height < h + 2 {
+        return;
+    }
+    let x = full_area.x + (full_area.width.saturating_sub(w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Rename tab  ·  Enter apply · Esc cancel ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    let label = format!(
+        " Active tab: {} ",
+        truncate(&app.tabs[app.active].title, w as usize - 14)
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[0],
+    );
+
+    let max_visible = (chunks[1].width as usize).saturating_sub(4);
+    let q_display = if app.rename_input.chars().count() > max_visible {
+        let skip = app.rename_input.chars().count() - max_visible;
+        app.rename_input.chars().skip(skip).collect::<String>()
+    } else {
+        app.rename_input.clone()
+    };
+    let input = Line::from(vec![
+        Span::styled(" ▶ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(q_display, Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(input).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        chunks[1],
+    );
+
+    let hint = " Empty + Enter → reset to cwd basename · Ctrl+U clears ";
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[2],
+    );
+}
+
+// ===========================================================================
 // Scrollback search overlay — pinned to the bottom 2 rows of the PTY area.
 // ===========================================================================
 fn render_search_overlay(f: &mut ratatui::Frame, pty_area: Rect, app: &mut App) {
@@ -2423,6 +2574,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("Ctrl+B",        "Files sidebar (chroot to tab cwd)"),
         ("Ctrl+`",        "Bottom shell pane (parent shell)"),
         ("Ctrl+F",        "Search active tab's scrollback"),
+        ("Shift+F2",      "Rename active tab"),
         ("Ctrl+Q",        "Quit"),
         ("Ctrl+PgUp/PgDn","Prev / next tab"),
         ("Alt+T/W",       "New / close tab"),
@@ -3027,6 +3179,10 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.toggle_search();
             Ok(KeyOutcome::LayoutChanged)
         }
+        Action::RenameActiveTab => {
+            app.open_rename();
+            Ok(KeyOutcome::LayoutChanged)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -3059,6 +3215,16 @@ fn handle_key(
             return Ok(KeyOutcome::LayoutChanged);
         }
         return Ok(KeyOutcome::Continue);
+    }
+
+    // Shift+F2 — rename the active tab.
+    if shift && k.code == KeyCode::F(2) {
+        return execute_action(Action::RenameActiveTab, app, pty_area);
+    }
+
+    // Rename modal eats all other keys while open.
+    if app.rename_open {
+        return handle_rename_key(k, app);
     }
 
     // Ctrl+` — toggle bottom terminal (global)
