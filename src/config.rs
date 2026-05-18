@@ -75,6 +75,11 @@ pub struct LayoutConfig {
     #[serde(default = "default_right_sidebar_width")]
     pub right_sidebar_width: u16,
     pub bottom_height: u16,
+    /// When true, the saved layout in `~/.cmux/layout.json` is restored
+    /// automatically on startup. Default off — opt-in so the first launch
+    /// behaviour stays predictable.
+    #[serde(default)]
+    pub auto_restore: bool,
 }
 
 fn default_right_sidebar_width() -> u16 {
@@ -87,6 +92,7 @@ impl Default for LayoutConfig {
             sidebar_width: 42,
             right_sidebar_width: 42,
             bottom_height: 12,
+            auto_restore: false,
         }
     }
 }
@@ -158,6 +164,9 @@ sidebar_width = 42
 right_sidebar_width = 42
 # Height in rows of the bottom shell pane
 bottom_height = 12
+# When true, ~/.cmux/layout.json is restored automatically on startup
+# (otherwise use F9 → "★ Restore previous layout" once per session).
+auto_restore = false
 
 [browser]
 # Show dot-files (.git, .claude, etc.) in the file browser / files sidebar

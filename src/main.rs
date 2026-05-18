@@ -1361,6 +1361,13 @@ fn main() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let mut app = App::new(cwd, pty_rows, pty_cols)?;
 
+    // Auto-restore: if the user opted in and a saved layout exists, replace
+    // the default freshly-spawned tab with the saved set before entering the
+    // run loop. Failures here are non-fatal — we fall back to the default tab.
+    if app.config.layout.auto_restore && app.saved_layout.is_some() {
+        let _ = app.restore_layout(pty_rows, pty_cols);
+    }
+
     let result = run(&mut terminal, &mut app);
 
     app.save_layout();
