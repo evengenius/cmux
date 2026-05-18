@@ -77,6 +77,9 @@ enum Action {
     OpenSaveLayoutAs,
     ToggleGlobalSessions,
     ToggleActivePin,
+    PrevProject,
+    NextProject,
+    SwitchProject(usize),
     ReloadConfig,
     Quit,
 }
@@ -729,6 +732,55 @@ impl App {
         &mut self.tabs[self.active]
     }
 
+    // -- Project grouping --------------------------------------------------
+    //
+    // A "project" is a unique cwd that one or more tabs share. The project
+    // list is recomputed on demand from the current tab list, preserving
+    // first-occurrence order so the bar doesn't jump around as tabs are
+    // opened/closed.
+
+    /// Distinct cwds in the order they first appear in `self.tabs`.
+    fn projects(&self) -> Vec<PathBuf> {
+        let mut seen: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::with_capacity(self.tabs.len());
+        let mut out = Vec::with_capacity(self.tabs.len());
+        for t in &self.tabs {
+            if seen.insert(t.cwd.clone()) {
+                out.push(t.cwd.clone());
+            }
+        }
+        out
+    }
+
+    /// cwd of the active tab — i.e., the active project. Falls back to the
+    /// launch cwd if there are somehow no tabs.
+    fn active_project_cwd(&self) -> PathBuf {
+        self.tabs
+            .get(self.active)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    /// Indices into `self.tabs` for the chats that belong to the active
+    /// project (same cwd as active tab). Order matches `self.tabs`.
+    fn chats_in_active_project(&self) -> Vec<usize> {
+        let proj = self.active_project_cwd();
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| if t.cwd == proj { Some(i) } else { None })
+            .collect()
+    }
+
+    /// Index of the active project in `projects()` order.
+    fn active_project_idx(&self) -> usize {
+        let proj = self.active_project_cwd();
+        self.projects()
+            .iter()
+            .position(|p| *p == proj)
+            .unwrap_or(0)
+    }
+
     fn open_tab(&mut self, rows: u16, cols: u16) -> Result<()> {
         // Spawn the new tab in the active tab's cwd — this is what the
         // user usually means by F2 ("another chat in this project"). Falls
@@ -761,20 +813,67 @@ impl App {
     }
 
     fn next_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
+        // Cycle within the active project's chats only.
+        let chats = self.chats_in_active_project();
+        if chats.len() <= 1 {
+            return;
         }
+        let pos = chats.iter().position(|&i| i == self.active).unwrap_or(0);
+        let next = chats[(pos + 1) % chats.len()];
+        self.active = next;
     }
 
     fn prev_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+        let chats = self.chats_in_active_project();
+        if chats.len() <= 1 {
+            return;
+        }
+        let pos = chats.iter().position(|&i| i == self.active).unwrap_or(0);
+        let prev = chats[(pos + chats.len() - 1) % chats.len()];
+        self.active = prev;
+    }
+
+    /// Switch to the Nth chat within the active project (Alt+1..9).
+    fn switch(&mut self, idx_in_project: usize) {
+        let chats = self.chats_in_active_project();
+        if let Some(&global) = chats.get(idx_in_project) {
+            self.active = global;
         }
     }
 
-    fn switch(&mut self, idx: usize) {
-        if idx < self.tabs.len() {
+    /// Switch to the first chat of the next project (Ctrl+F12).
+    fn next_project(&mut self) {
+        let projs = self.projects();
+        if projs.len() <= 1 {
+            return;
+        }
+        let pos = self.active_project_idx();
+        let target_cwd = &projs[(pos + 1) % projs.len()];
+        if let Some(idx) = self.tabs.iter().position(|t| t.cwd == *target_cwd) {
             self.active = idx;
+        }
+    }
+
+    /// Switch to the first chat of the previous project (Ctrl+F11).
+    fn prev_project(&mut self) {
+        let projs = self.projects();
+        if projs.len() <= 1 {
+            return;
+        }
+        let pos = self.active_project_idx();
+        let target_cwd = &projs[(pos + projs.len() - 1) % projs.len()];
+        if let Some(idx) = self.tabs.iter().position(|t| t.cwd == *target_cwd) {
+            self.active = idx;
+        }
+    }
+
+    /// Switch to the Nth project (Ctrl+Shift+1..9). N is 0-based here.
+    fn switch_project(&mut self, project_idx: usize) {
+        let projs = self.projects();
+        if let Some(target_cwd) = projs.get(project_idx) {
+            if let Some(idx) = self.tabs.iter().position(|t| t.cwd == *target_cwd) {
+                self.active = idx;
+            }
         }
     }
 
@@ -1311,8 +1410,10 @@ impl App {
         };
         push_action(&mut items, "★  New tab", Action::NewTab);
         push_action(&mut items, "★  Close active tab", Action::CloseTab);
-        push_action(&mut items, "★  Previous tab", Action::PrevTab);
-        push_action(&mut items, "★  Next tab", Action::NextTab);
+        push_action(&mut items, "★  Previous chat (in project)", Action::PrevTab);
+        push_action(&mut items, "★  Next chat (in project)", Action::NextTab);
+        push_action(&mut items, "★  Previous project (Ctrl+F11)", Action::PrevProject);
+        push_action(&mut items, "★  Next project (Ctrl+F12)", Action::NextProject);
         push_action(&mut items, "★  Toggle sessions sidebar", Action::ToggleSidebar);
         push_action(
             &mut items,
@@ -3416,7 +3517,9 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("F8",            "Close active tab (last tab kept)"),
         ("F9",            "Command palette (actions + sessions)"),
         ("F10",           "Quit"),
-        ("F11 / F12",     "Previous / next tab"),
+        ("F11 / F12",     "Previous / next chat (within active project)"),
+        ("Ctrl+F11/F12",  "Previous / next project"),
+        ("Ctrl+Shift+1..9","Switch to project N"),
         ("Ctrl+B",        "Files sidebar (chroot to tab cwd)"),
         ("Ctrl+`",        "Bottom shell pane (parent shell)"),
         ("Ctrl+F",        "Search active tab's scrollback"),
@@ -3426,7 +3529,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("Ctrl+Q",        "Quit"),
         ("Ctrl+PgUp/PgDn","Prev / next tab"),
         ("Alt+T/W",       "New / close tab"),
-        ("Alt+1..9",      "Switch to tab N"),
+        ("Alt+1..9",      "Switch to chat N within active project"),
         ("Alt+←/→",       "Prev / next tab"),
         ("PgUp/PgDn",     "Scroll PTY history (when claude focused)"),
         ("Ctrl+R (in F3)","Refresh session list from disk"),
@@ -4049,6 +4152,21 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.toggle_active_pin();
             Ok(KeyOutcome::LayoutChanged)
         }
+        Action::PrevProject => {
+            app.prev_project();
+            app.on_active_changed();
+            Ok(KeyOutcome::Continue)
+        }
+        Action::NextProject => {
+            app.next_project();
+            app.on_active_changed();
+            Ok(KeyOutcome::Continue)
+        }
+        Action::SwitchProject(n) => {
+            app.switch_project(n);
+            app.on_active_changed();
+            Ok(KeyOutcome::Continue)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -4260,11 +4378,25 @@ fn handle_key(
     match k.code {
         KeyCode::F(2) => return execute_action(Action::NewTab, app, pty_area),
         KeyCode::F(8) => return execute_action(Action::CloseTab, app, pty_area),
+        // Ctrl+F11 / Ctrl+F12 jump between projects (project bar);
+        // bare F11 / F12 cycle chats within the current project.
+        KeyCode::F(11) if ctrl => return execute_action(Action::PrevProject, app, pty_area),
+        KeyCode::F(12) if ctrl => return execute_action(Action::NextProject, app, pty_area),
         KeyCode::F(11) => return execute_action(Action::PrevTab, app, pty_area),
         KeyCode::F(12) => return execute_action(Action::NextTab, app, pty_area),
         KeyCode::PageUp if ctrl => return execute_action(Action::PrevTab, app, pty_area),
         KeyCode::PageDown if ctrl => return execute_action(Action::NextTab, app, pty_area),
         _ => {}
+    }
+
+    // Ctrl+Shift+1..9 — jump straight to project N (1-based).
+    if ctrl && shift {
+        if let KeyCode::Char(c) = k.code {
+            if c.is_ascii_digit() && c != '0' {
+                let idx = (c as u8 - b'1') as usize;
+                return execute_action(Action::SwitchProject(idx), app, pty_area);
+            }
+        }
     }
 
     if alt {
