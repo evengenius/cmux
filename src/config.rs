@@ -20,6 +20,12 @@ pub struct Config {
     pub keys: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub git: GitConfig,
+    /// User-defined text snippets surfaced in the F9 palette as
+    /// `★ Insert snippet: <name>`. The selected snippet's text is sent to
+    /// the active chat's input (no trailing `\r`, so the user can edit
+    /// before submitting).
+    #[serde(default)]
+    pub snippets: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -102,6 +108,13 @@ pub struct NotifyConfig {
     /// integration by flipping this on.
     #[serde(default)]
     pub osc: bool,
+    /// HTTP webhook URL to POST a JSON body to on every AwaitingPermission
+    /// transition. Empty = disabled. Useful for Slack incoming webhooks,
+    /// Discord webhooks, ntfy.sh, custom dispatch servers. Fires
+    /// fire-and-forget via `curl`; if curl isn't on PATH this silently
+    /// no-ops.
+    #[serde(default)]
+    pub webhook: String,
 }
 
 fn default_true() -> bool {
@@ -114,6 +127,7 @@ impl Default for NotifyConfig {
             bell: true,
             toast: true,
             osc: false,
+            webhook: String::new(),
         }
     }
 }
@@ -294,6 +308,11 @@ toast = true
 # native system notifications. Off by default because most terminals
 # ignore them and a few render the escape as visible garbage.
 osc = false
+# HTTP webhook URL. POST'd a JSON body
+#   { "title": "...", "body": "...", "tab": "...", "cwd": "..." }
+# on every AwaitingPermission transition. Empty = disabled. Uses curl —
+# silently no-op if curl is absent.
+webhook = ""
 
 [theme]
 # Accent colour. Used for: active-project highlight on the project bar,
@@ -324,6 +343,14 @@ remove_on_close = true
 # Example:
 #   toggle_search = "f4"        # F4 opens search instead of F4=commands
 #   quit = "ctrl-x"             # Ctrl+X quits (in addition to F10/Ctrl+Q)
+
+[snippets]
+# User-defined text snippets — appear in the F9 palette as
+# "★ Insert snippet: <name>" and write into the active chat's input box
+# (no trailing newline, so you can review/edit before sending).
+# Example:
+#   review_carefully = "Review this carefully and list issues by severity."
+#   commit = "Commit changes with a clear conventional commit message."
 "#;
 
 pub fn ensure_default_written() {

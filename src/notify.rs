@@ -30,6 +30,51 @@ pub fn osc_notify(title: &str, body: &str) {
 /// (0x9c), and `;` which is the OSC field separator. A user-supplied tab
 /// title containing a newline used to terminate the OSC early and corrupt
 /// the next render; this filter prevents that.
+/// POST a JSON `{title, body, tab, cwd}` payload to `url` via background
+/// curl. Fire-and-forget — failures are silent so a misconfigured webhook
+/// never disrupts the TUI.
+pub fn webhook(url: &str, title: &str, body: &str, tab: &str, cwd: &str) {
+    if url.trim().is_empty() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "title": title,
+        "body": body,
+        "tab": tab,
+        "cwd": cwd,
+    })
+    .to_string();
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "-sS",
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        "--data-binary",
+        "@-",
+        "--max-time",
+        "5",
+    ])
+    .arg(url)
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let Ok(mut child) = cmd.spawn() else {
+        return;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+        // dropping stdin closes it so curl sees EOF
+    }
+    // Don't wait — we don't care about the result and don't want to block.
+}
+
 fn sanitise(s: &str) -> String {
     s.chars()
         .filter(|&c| {

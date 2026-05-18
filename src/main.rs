@@ -120,6 +120,12 @@ enum Action {
     CopyLastResponse,
     /// Pop the most recently closed chat off the undo stack and respawn it.
     ReopenLastClosed,
+    /// Insert snippet number `n` (index into the sorted snippets list) into
+    /// the active chat's input. No trailing `\r` — the user submits.
+    InsertSnippet(usize),
+    /// Export a Markdown summary of the active chat's session to
+    /// `<cwd>/sessions/<ts>-<slug>.md`. Inspired by iannuttall/claude-sessions.
+    ExportSessionNote,
     ReloadConfig,
     Quit,
 }
@@ -1603,6 +1609,59 @@ impl App {
         self.confirm.open = true;
     }
 
+    /// Write a Markdown summary of the active chat's session to
+    /// `<cwd>/sessions/YYYY-MM-DD-HHMM-<slug>.md`. Surface success/failure
+    /// via the usage modal.
+    fn export_session_note(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let cwd = tab.cwd.clone();
+        let title = tab.title.clone();
+        let dir = cwd.join("sessions");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.usage_lines = vec![format!(" create dir failed: {} ", e)];
+            self.usage_open = true;
+            return;
+        }
+        let now = chrono_like_stamp();
+        let slug = title
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .chars()
+            .take(40)
+            .collect::<String>();
+        let fname = if slug.is_empty() {
+            format!("{}.md", now)
+        } else {
+            format!("{}-{}.md", now, slug)
+        };
+        let path = dir.join(&fname);
+
+        let session = self.resolve_active_session();
+        let body = build_session_markdown(&title, &cwd, session.as_ref());
+        match std::fs::write(&path, body) {
+            Ok(()) => {
+                self.usage_lines = vec![
+                    " Session note written: ".into(),
+                    format!(" {} ", path.display()),
+                ];
+            }
+            Err(e) => {
+                self.usage_lines = vec![format!(" write failed: {} ", e)];
+            }
+        }
+        self.usage_open = true;
+    }
+
     /// Dump the active tab's plain-text scrollback to the system clipboard.
     /// Result is shown via the usage modal (reused as a generic "info"
     /// surface here). The text_buffer mutex is dropped before formatting
@@ -2175,6 +2234,20 @@ impl App {
             "★  Reopen most recently closed chat (Ctrl+Shift+T)",
             Action::ReopenLastClosed,
         );
+        push_action(
+            &mut items,
+            "★  Export session note (Markdown → <cwd>/sessions/)",
+            Action::ExportSessionNote,
+        );
+        for (i, (name, text)) in self.config.snippets.iter().enumerate() {
+            let preview = text.chars().take(40).collect::<String>();
+            let label = format!("✎  Insert snippet: {} — {}", name, preview);
+            items.push(PaletteItem {
+                label: label.clone(),
+                hay: format!("snippet {} {}", name.to_lowercase(), text.to_lowercase()),
+                kind: PaletteKind::Action(Action::InsertSnippet(i)),
+            });
+        }
         push_action(&mut items, "★  Close active tab", Action::CloseTab);
         push_action(&mut items, "★  Previous chat (in project)", Action::PrevTab);
         push_action(&mut items, "★  Next chat (in project)", Action::NextTab);
@@ -2774,6 +2847,122 @@ OPTIONS:
     );
 }
 
+/// Return a `YYYY-MM-DD-HHMM` stamp in UTC. We don't depend on chrono — the
+/// stdlib gives us enough.
+fn chrono_like_stamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Days since 1970-01-01 (Thursday). civil_from_days adapted from
+    // Howard Hinnant's date algorithms.
+    let z = now as i64 / 86_400 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64 + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let secs_in_day = now % 86_400;
+    let h = secs_in_day / 3600;
+    let mins = (secs_in_day % 3600) / 60;
+    format!("{:04}-{:02}-{:02}-{:02}{:02}", y, m, d, h, mins)
+}
+
+/// Build the Markdown body for the session-note export.
+fn build_session_markdown(
+    title: &str,
+    cwd: &Path,
+    session: Option<&SessionMeta>,
+) -> String {
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "# {}", title);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- generated:  {} UTC", chrono_like_stamp());
+    let _ = writeln!(out, "- cwd:        {}", cwd.display());
+    if let Some(s) = session {
+        let _ = writeln!(out, "- session id: {}", s.id);
+        if let Some(b) = &s.git_branch {
+            let _ = writeln!(out, "- git branch: {}", b);
+        }
+        let _ = writeln!(out, "- messages:   {}", s.message_count);
+        let _ = writeln!(out, "- tokens:     {}", format_tokens(s.total_tokens));
+        let _ = writeln!(out, "- jsonl:      {}", s.file_path.display());
+        let _ = writeln!(out);
+        // First and last user prompts + last assistant turn.
+        if let Ok((first_user, last_user, last_assistant)) =
+            extract_session_milestones(&s.file_path)
+        {
+            if !first_user.is_empty() {
+                let _ = writeln!(out, "## First user prompt\n\n```\n{}\n```\n", first_user.trim());
+            }
+            if !last_user.is_empty() && last_user != first_user {
+                let _ = writeln!(out, "## Last user prompt\n\n```\n{}\n```\n", last_user.trim());
+            }
+            if !last_assistant.is_empty() {
+                let _ = writeln!(out, "## Last assistant response\n\n{}\n", last_assistant);
+            }
+        }
+    } else {
+        let _ = writeln!(out, "- session id: (not resolved)");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "_(no jsonl found — the chat is brand-new or its cwd doesn't match any ~/.claude/projects entry.)_");
+    }
+    out
+}
+
+/// Return `(first_user, last_user, last_assistant)` text from a claude jsonl.
+fn extract_session_milestones(
+    path: &Path,
+) -> std::io::Result<(String, String, String)> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let rdr = std::io::BufReader::new(file);
+    let mut first_user = String::new();
+    let mut last_user = String::new();
+    let mut last_assistant = String::new();
+    for line in rdr.lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let typ = v.get("type").and_then(|t| t.as_str());
+        if typ != Some("user") && typ != Some("assistant") {
+            continue;
+        }
+        let content = v.get("message").and_then(|m| m.get("content"));
+        let text = match content {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(|t| t.as_str()) != Some("text") {
+                        return None;
+                    }
+                    b.get("text").and_then(|t| t.as_str()).map(String::from)
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        if typ == Some("user") {
+            if first_user.is_empty() {
+                first_user = text.clone();
+            }
+            last_user = text;
+        } else {
+            last_assistant = text;
+        }
+    }
+    Ok((first_user, last_user, last_assistant))
+}
+
 /// Find the text content of the most recent `assistant` entry in a claude
 /// jsonl. Skips tool_use / system entries. Returns "" if none found.
 fn last_assistant_text(path: &Path) -> std::io::Result<String> {
@@ -2989,6 +3178,7 @@ fn action_from_str(s: &str) -> Option<Action> {
         "show_active_usage" | "usage" => Action::ShowActiveUsage,
         "show_git_diff" | "git_diff" | "diff" => Action::ShowGitDiff,
         "reopen_last_closed" | "reopen" => Action::ReopenLastClosed,
+        "export_session_note" | "export_note" | "journal" => Action::ExportSessionNote,
         _ => return None,
     })
 }
@@ -3398,6 +3588,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
         let bell = app.config.notify.bell;
         let toast = app.config.notify.toast;
         let osc = app.config.notify.osc;
+        let webhook_url = app.config.notify.webhook.clone();
         let mut fired_bell = false;
         let mut fired_osc = false;
         let active_idx = app.active;
@@ -3428,6 +3619,15 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                         notify::toast(
                             &format!("{} needs you", tab.title),
                             "claude is waiting on a permission prompt",
+                        );
+                    }
+                    if !webhook_url.is_empty() {
+                        notify::webhook(
+                            &webhook_url,
+                            &format!("{} needs you", tab.title),
+                            "claude is waiting on a permission prompt",
+                            &tab.title,
+                            &tab.cwd.to_string_lossy(),
                         );
                     }
                 }
@@ -6318,6 +6518,23 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
                 app.on_active_changed();
                 app.save_layout();
             }
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::InsertSnippet(idx) => {
+            let Some((_, text)) = app
+                .config
+                .snippets
+                .iter()
+                .nth(idx)
+                .map(|(k, v)| (k.clone(), v.clone()))
+            else {
+                return Ok(KeyOutcome::Continue);
+            };
+            app.active_tab().write_input(text.as_bytes())?;
+            Ok(KeyOutcome::Continue)
+        }
+        Action::ExportSessionNote => {
+            app.export_session_note();
             Ok(KeyOutcome::LayoutChanged)
         }
         Action::Quit => Ok(KeyOutcome::Quit),
