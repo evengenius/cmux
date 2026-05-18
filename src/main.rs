@@ -4,10 +4,12 @@ mod config;
 mod grep;
 mod layout;
 mod notify;
+mod scrollback_text;
 mod sessions;
 mod shell;
 
 use commands::{CommandEntry, CommandSource};
+use scrollback_text::ScrollbackText;
 
 use std::{
     io::{Read, Write},
@@ -69,6 +71,7 @@ enum Action {
     ToggleBottom,
     ToggleCommands,
     ToggleHelp,
+    ToggleSearch,
     RestoreLayout,
     ReloadConfig,
     Quit,
@@ -160,6 +163,31 @@ enum PaletteResult {
 }
 
 // ===========================================================================
+// Scrollback search state (Ctrl+F)
+// ===========================================================================
+#[derive(Default)]
+struct SearchState {
+    open: bool,
+    query: String,
+    matches: Vec<scrollback_text::Match>,
+    /// Index into `matches` of the currently focused hit.
+    idx: usize,
+    /// Tab the search applies to. Closing the search clears this; switching
+    /// tabs while open also resets matches.
+    tab_idx: Option<usize>,
+}
+
+impl SearchState {
+    fn clear(&mut self) {
+        self.open = false;
+        self.query.clear();
+        self.matches.clear();
+        self.idx = 0;
+        self.tab_idx = None;
+    }
+}
+
+// ===========================================================================
 // ChatTab
 // ===========================================================================
 struct ChatTab {
@@ -173,6 +201,9 @@ struct ChatTab {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
+    /// Plain-text mirror of the PTY output, fed alongside the vt100 parser.
+    /// Used by the Ctrl+F scrollback search.
+    text_buffer: Arc<Mutex<ScrollbackText>>,
     /// True while the tab has already fired its AwaitingPermission notification
     /// for the current "stuck" period. Cleared once state leaves Awaiting so
     /// the next transition fires again.
@@ -236,11 +267,13 @@ impl ChatTab {
         let parser = Arc::new(Mutex::new(Parser::new(rows, cols, SCROLLBACK_LINES)));
         let dirty = Arc::new(AtomicBool::new(true));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let text_buffer = Arc::new(Mutex::new(ScrollbackText::new()));
 
         let mut reader = pair.master.try_clone_reader()?;
         let parser_for_reader = parser.clone();
         let dirty_for_reader = dirty.clone();
         let activity_for_reader = last_activity.clone();
+        let text_for_reader = text_buffer.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -249,6 +282,9 @@ impl ChatTab {
                     Ok(n) => {
                         if let Ok(mut p) = parser_for_reader.lock() {
                             p.process(&buf[..n]);
+                        }
+                        if let Ok(mut t) = text_for_reader.lock() {
+                            t.feed(&buf[..n]);
                         }
                         dirty_for_reader.store(true, Ordering::Release);
                         if let Ok(mut t) = activity_for_reader.lock() {
@@ -273,6 +309,7 @@ impl ChatTab {
             master: pair.master,
             writer,
             child,
+            text_buffer,
             notified_awaiting: false,
         })
     }
@@ -520,6 +557,8 @@ struct App {
     commands_filtered: Vec<usize>,
     // help overlay
     help_open: bool,
+    // scrollback search (Ctrl+F)
+    search: SearchState,
     // persisted layout (if any was found at startup)
     saved_layout: Option<layout::SavedLayout>,
     // user config
@@ -571,6 +610,7 @@ impl App {
             commands_list: Vec::new(),
             commands_filtered: Vec::new(),
             help_open: false,
+            search: SearchState::default(),
             saved_layout: layout::load(),
             config: config::load(),
         })
@@ -767,6 +807,93 @@ impl App {
             self.ensure_browser_for_active_tab();
         }
         self.follow_bottom_to_active();
+        // Search is scoped to a single tab — close it on switch so the user
+        // doesn't see results that apply to a tab they're no longer on.
+        if self.search.open {
+            self.search.clear();
+        }
+    }
+
+    // -- scrollback search (Ctrl+F) ----------------------------------------
+
+    fn toggle_search(&mut self) {
+        if self.search.open {
+            // Closing — reset scrollback to bottom so the user returns to
+            // live output. Without this they're stuck wherever the last
+            // match jumped them.
+            if let Some(tab) = self.tabs.get(self.active) {
+                if let Ok(mut p) = tab.parser.lock() {
+                    p.set_scrollback(0);
+                }
+                tab.dirty.store(true, Ordering::Release);
+            }
+            self.search.clear();
+        } else {
+            self.search.open = true;
+            self.search.tab_idx = Some(self.active);
+        }
+    }
+
+    fn search_rerun(&mut self) {
+        let Some(tab_idx) = self.search.tab_idx else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(tab_idx) else {
+            return;
+        };
+        let matches = tab
+            .text_buffer
+            .lock()
+            .map(|buf| buf.find_all(&self.search.query))
+            .unwrap_or_default();
+        self.search.matches = matches;
+        self.search.idx = 0;
+        // After re-search, jump to the FIRST match (which by buffer order is
+        // the oldest hit) so the user can step forward chronologically.
+        self.apply_search_jump();
+    }
+
+    fn search_next(&mut self) {
+        if self.search.matches.is_empty() {
+            return;
+        }
+        self.search.idx = (self.search.idx + 1) % self.search.matches.len();
+        self.apply_search_jump();
+    }
+
+    fn search_prev(&mut self) {
+        if self.search.matches.is_empty() {
+            return;
+        }
+        let n = self.search.matches.len();
+        self.search.idx = (self.search.idx + n - 1) % n;
+        self.apply_search_jump();
+    }
+
+    /// Move the active tab's PTY scrollback so the current match line is
+    /// roughly in view. Mapping is approximate: text-buffer line offsets
+    /// don't account for vt100 line wrapping, but the user lands within a
+    /// few rows.
+    fn apply_search_jump(&self) {
+        let Some(tab_idx) = self.search.tab_idx else {
+            return;
+        };
+        let Some(m) = self.search.matches.get(self.search.idx) else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(tab_idx) else {
+            return;
+        };
+        let offset = tab
+            .text_buffer
+            .lock()
+            .map(|buf| buf.lines_above_bottom(m.line_idx))
+            .unwrap_or(0);
+        let capped = offset.min(SCROLLBACK_LINES);
+        if let Ok(mut p) = tab.parser.lock() {
+            p.set_scrollback(capped);
+        }
+        tab.dirty.store(true, Ordering::Release);
     }
 
     /// If the bottom shell is open and follow-mode is on, `cd` it to the
@@ -889,6 +1016,7 @@ impl App {
         push_action(&mut items, "★  Toggle deep-grep", Action::ToggleDeepGrep);
         push_action(&mut items, "★  Open file browser (modal)", Action::ToggleBrowser);
         push_action(&mut items, "★  Toggle bottom terminal", Action::ToggleBottom);
+        push_action(&mut items, "★  Search scrollback (Ctrl+F)", Action::ToggleSearch);
         push_action(&mut items, "★  Toggle mouse mode", Action::ToggleMouse);
         let cfg_path = config::config_path();
         let cfg_label = format!("★  Reload config ({})", cfg_path.display());
@@ -1418,6 +1546,13 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                     chunks[2],
                 );
 
+                // Scrollback search bar — overlays the bottom 2 rows of the
+                // PTY area when active. Drawn before the global modals so
+                // browser/palette/help still take precedence.
+                if app.search.open {
+                    render_search_overlay(f, pty_area, app);
+                }
+
                 // Overlays — drawn last so they sit on top of everything.
                 if app.browser_open {
                     render_browser(f, f.area(), app);
@@ -1587,6 +1722,39 @@ fn render_tab_bar(
     ));
 
     (Line::from(spans), rects, new_rect)
+}
+
+// ===========================================================================
+// Search-overlay key handler (Ctrl+F)
+// ===========================================================================
+fn handle_search_key(k: crossterm::event::KeyEvent, app: &mut App) -> Result<KeyOutcome> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+
+    match k.code {
+        KeyCode::Esc => {
+            app.toggle_search();
+            return Ok(KeyOutcome::LayoutChanged);
+        }
+        KeyCode::Enter => {
+            app.search_next();
+        }
+        KeyCode::Up => app.search_prev(),
+        KeyCode::Down => app.search_next(),
+        // n/N work as case-sensitive next/prev like in vi-style searches.
+        KeyCode::Char('n') if ctrl => app.search_next(),
+        KeyCode::Char('p') if ctrl => app.search_prev(),
+        // Empty query + Backspace is a no-op; Esc is the documented close.
+        KeyCode::Backspace if app.search.query.pop().is_some() => {
+            app.search_rerun();
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            app.search.query.push(c);
+            app.search_rerun();
+        }
+        _ => {}
+    }
+    Ok(KeyOutcome::Continue)
 }
 
 // ===========================================================================
@@ -1943,6 +2111,153 @@ fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
 }
 
 // ===========================================================================
+// Scrollback search overlay — pinned to the bottom 2 rows of the PTY area.
+// ===========================================================================
+fn render_search_overlay(f: &mut ratatui::Frame, pty_area: Rect, app: &mut App) {
+    if pty_area.height < 2 {
+        return;
+    }
+    let bar_area = Rect {
+        x: pty_area.x,
+        y: pty_area.y + pty_area.height - 2,
+        width: pty_area.width,
+        height: 2,
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(bar_area);
+
+    // Header row — input + match counter + hint.
+    let counter = if app.search.query.is_empty() {
+        " type to search ".to_string()
+    } else if app.search.matches.is_empty() {
+        " 0 matches ".to_string()
+    } else {
+        format!(" {}/{} ", app.search.idx + 1, app.search.matches.len())
+    };
+    let hint = " ↑/↓ step · Esc close ";
+
+    // Reserve room on the right for counter + hint so the query doesn't push
+    // them off-screen.
+    let right_w = counter.chars().count() + hint.chars().count();
+    let q_max = (chunks[0].width as usize).saturating_sub(right_w + 4);
+    let q_display = if app.search.query.chars().count() > q_max {
+        let skip = app.search.query.chars().count() - q_max;
+        app.search.query.chars().skip(skip).collect::<String>()
+    } else {
+        app.search.query.clone()
+    };
+
+    let header = Line::from(vec![
+        Span::styled(
+            " 🔍 ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(q_display, Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+        Span::raw(" "),
+        Span::styled(
+            counter,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(hint, Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(header).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        chunks[0],
+    );
+
+    // Snippet row — show the current match's line with the matched substring
+    // highlighted in yellow. Empty placeholder when no matches.
+    let snippet_line = match (
+        app.search.tab_idx,
+        app.search.matches.get(app.search.idx).copied(),
+    ) {
+        (Some(tab_idx), Some(m)) => app
+            .tabs
+            .get(tab_idx)
+            .and_then(|t| t.text_buffer.lock().ok().map(|b| (m, build_snippet(&b, m, chunks[1].width as usize))))
+            .map(|(_, line)| line)
+            .unwrap_or_else(|| Line::raw("")),
+        _ => Line::raw(""),
+    };
+    f.render_widget(
+        Paragraph::new(snippet_line).style(Style::default().bg(Color::Rgb(20, 20, 24))),
+        chunks[1],
+    );
+}
+
+/// Build a single styled line: a window around `m.col` with the matched
+/// substring highlighted. Width is capped at `max_w` columns.
+fn build_snippet(buf: &ScrollbackText, m: scrollback_text::Match, max_w: usize) -> Line<'static> {
+    let line = match buf.line(m.line_idx) {
+        Some(s) => s.to_string(),
+        None => return Line::raw(""),
+    };
+    // Index into byte positions of the line — m.col is a byte offset because
+    // ScrollbackText::find_all uses str::find on bytes.
+    let line_len = line.len();
+    let match_end = (m.col + m.len).min(line_len);
+
+    // Center the match inside max_w, leaving ~equal context on both sides.
+    let context = max_w.saturating_sub(m.len + 6) / 2;
+    let win_start = m.col.saturating_sub(context);
+    let win_end = (match_end + context).min(line_len);
+
+    // Snap to char boundaries.
+    let win_start = floor_char_boundary(&line, win_start);
+    let win_end = ceil_char_boundary(&line, win_end);
+    let m_col = floor_char_boundary(&line, m.col);
+    let m_end = ceil_char_boundary(&line, match_end);
+
+    let prefix_marker = if win_start > 0 { "…" } else { " " };
+    let suffix_marker = if win_end < line_len { "…" } else { " " };
+
+    let pre = &line[win_start..m_col];
+    let hit = &line[m_col..m_end];
+    let post = &line[m_end..win_end];
+
+    Line::from(vec![
+        Span::styled(prefix_marker, Style::default().fg(Color::DarkGray)),
+        Span::styled(pre.to_string(), Style::default().fg(Color::Gray)),
+        Span::styled(
+            hit.to_string(),
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(post.to_string(), Style::default().fg(Color::Gray)),
+        Span::styled(suffix_marker, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) && i > 0 {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    let len = s.len();
+    if i >= len {
+        return len;
+    }
+    while !s.is_char_boundary(i) && i < len {
+        i += 1;
+    }
+    i
+}
+
+// ===========================================================================
 // Palette rendering — modal overlay centered on the screen.
 // ===========================================================================
 fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
@@ -2107,6 +2422,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
         ("F11 / F12",     "Previous / next tab"),
         ("Ctrl+B",        "Files sidebar (chroot to tab cwd)"),
         ("Ctrl+`",        "Bottom shell pane (parent shell)"),
+        ("Ctrl+F",        "Search active tab's scrollback"),
         ("Ctrl+Q",        "Quit"),
         ("Ctrl+PgUp/PgDn","Prev / next tab"),
         ("Alt+T/W",       "New / close tab"),
@@ -2707,6 +3023,10 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.toggle_help();
             Ok(KeyOutcome::LayoutChanged)
         }
+        Action::ToggleSearch => {
+            app.toggle_search();
+            Ok(KeyOutcome::LayoutChanged)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -2744,6 +3064,16 @@ fn handle_key(
     // Ctrl+` — toggle bottom terminal (global)
     if ctrl && matches!(k.code, KeyCode::Char('`') | KeyCode::Char('~')) {
         return execute_action(Action::ToggleBottom, app, pty_area);
+    }
+
+    // Ctrl+F — toggle scrollback search on the active tab (global).
+    if ctrl && matches!(k.code, KeyCode::Char('f') | KeyCode::Char('F')) {
+        return execute_action(Action::ToggleSearch, app, pty_area);
+    }
+
+    // While search overlay is open, swallow keys.
+    if app.search.open {
+        return handle_search_key(k, app);
     }
 
     // If the bottom pane is focused, route keystrokes there (Esc unfocuses).
