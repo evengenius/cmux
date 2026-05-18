@@ -1,123 +1,131 @@
 # cmux
 
-> A Midnight-Commander-style TUI host for the [Claude Code](https://claude.com/claude-code) CLI.
-> Run several `claude` sessions side-by-side in one terminal window — with tabs, sessions sidebar,
-> cross-session search, file browser, a bottom shell pane, and an activity indicator that tells you
-> which session is waiting for your permission.
+*Русский · [English version](README.en.md)*
 
-## What it gives you over plain `claude`
+**Кратко** — TUI в стиле Midnight Commander, который позволяет запускать несколько сессий `claude` в одном окне терминала: вкладки, боковые панели, нижняя shell-панель и индикатор, показывающий, какая сессия ждёт вашего ответа.
 
-- **Tabs** — open multiple `claude` processes in one window, switch with `F11/F12` or click.
-- **Sessions sidebar** (`F3`) — list every session from `~/.claude/projects/`, live-filter by title/cwd/branch, `Enter` to resume in a new tab.
-- **Deep grep** (`F5`) — when filtering sessions, grep through the actual `.jsonl` content in the background and see snippet previews of where the match was.
-- **Files sidebar** (`Ctrl+B`) — VSCode-style file tree, chrooted to the active tab's cwd; `Space` inserts the relative path into the chat input.
-- **File explorer modal** (`F6`) — navigate the whole filesystem; `Space` inserts an absolute path into the chat input.
-- **Command palette** (`F9`) — fuzzy-pick any action *or* any session.
-- **Bottom shell pane** (`Ctrl+\``) — embedded PTY running your parent shell (PowerShell / pwsh / bash / cmd, auto-detected). Run `git status`, `cargo build` etc. without switching windows.
-- **Activity overlay** — each tab shows `●` (streaming) or `!` (awaiting permission) so you can run several Claude sessions in parallel and see who needs you.
-- **Persistent layout** — when you quit, tabs and their session IDs are saved to `~/.cmux/layout.json`; on next launch, `F9 → Restore previous layout` brings them all back with `--resume`.
-- **Click-friendly chrome** — every F-key has a button in the bottom bar; tabs, `+`, borders are all clickable; drag borders to resize.
+---
 
-## Requirements
+## Описание
 
-- Windows 10+ (other OSes may work but only Windows is tested)
-- [Claude Code](https://claude.com/claude-code) installed and on `PATH` as `claude.cmd`
-- Rust toolchain (>= 1.75) to build from source
+TUI-обёртка в стиле Midnight Commander для CLI [Claude Code](https://claude.com/claude-code).
+Запускайте несколько сессий `claude` бок о бок в одном окне терминала — с вкладками, панелью
+сессий, сквозным поиском, файловым браузером, нижней shell-панелью и индикатором активности,
+который подсказывает, какая из сессий ждёт вашего подтверждения.
 
-## Install
+## Что даёт по сравнению с обычным `claude`
+
+- **Вкладки** — несколько процессов `claude` в одном окне, переключение `F11/F12` или мышью.
+- **Боковая панель сессий** (`F3`) — список всех сессий из `~/.claude/projects/`, живой фильтр по заголовку/cwd/ветке, `Enter` — возобновить в новой вкладке.
+- **Глубокий grep** (`F5`) — при фильтрации сессий ищет в фоне по содержимому `.jsonl`-файлов и показывает превью совпадений.
+- **Боковая панель файлов** (`Ctrl+B`) — дерево файлов в стиле VSCode, ограниченное cwd активной вкладки; `Space` вставляет относительный путь в чат.
+- **Модальный файловый проводник** (`F6`) — навигация по всей файловой системе; `Space` вставляет абсолютный путь в чат.
+- **Палитра команд** (`F9`) — нечёткий поиск любого действия *или* любой сессии.
+- **Нижняя shell-панель** (`Ctrl+\``) — встроенный PTY с вашим родительским шеллом (PowerShell / pwsh / bash / cmd, автодетект). Запускайте `git status`, `cargo build` и т.п., не переключаясь между окнами.
+- **Оверлей активности** — каждая вкладка показывает `●` (идёт вывод) или `!` (ждёт разрешения), так что можно вести несколько сессий Claude параллельно и видеть, кому вы нужны.
+- **Сохраняемый layout** — при выходе вкладки и их session ID пишутся в `~/.cmux/layout.json`; при следующем запуске `F9 → Restore previous layout` восстанавливает их с `--resume`.
+- **Клик-френдли интерфейс** — у каждой F-клавиши есть кнопка в нижней панели; вкладки, `+`, границы — кликабельны; границы тянутся мышью.
+
+## Требования
+
+- Windows 10+ (другие ОС могут работать, но тестировался только Windows)
+- [Claude Code](https://claude.com/claude-code), установленный и доступный в `PATH` как `claude.cmd`
+- Rust toolchain (>= 1.75) для сборки из исходников
+
+## Установка
 
 ```powershell
 git clone https://github.com/evengenius/cmux
 cd cmux
 cargo build --release
-# Resulting binary: target/release/cmux.exe
+# Получившийся бинарь: target/release/cmux.exe
 ```
 
-Move/symlink `target/release/cmux.exe` somewhere on your `PATH`, then run `cmux`.
+Перенесите/симлинкуйте `target/release/cmux.exe` куда-нибудь в `PATH`, потом запускайте `cmux`.
 
-## Keyboard quick-reference
+## Шпаргалка по клавишам
 
-| Key | Action |
+| Клавиша | Действие |
 | --- | --- |
-| `F1` | Help overlay (full keymap) |
-| `F2` | New tab |
-| `F3` | Sessions sidebar |
-| `F4` | Claude commands sidebar |
-| `F5` | Toggle deep-grep (in Sessions) |
-| `F6` | File explorer (modal, whole filesystem) |
-| `F7` | Toggle mouse mode (off = native terminal text select) |
-| `F8` | Close active tab (last tab kept) |
-| `F9` | Command palette |
-| `F10` / `Ctrl+Q` | Quit |
-| `F11` / `F12` | Previous / next tab |
-| `Ctrl+B` | Files sidebar (chrooted to tab cwd) |
-| `` Ctrl+` `` | Bottom shell pane |
-| `Esc` (in sidebar / bottom) | Unfocus — panel stays visible, keys go back to claude |
-| `Alt+1..9` | Switch to tab N |
-| `Alt+T` / `Alt+W` | New / close tab |
-| `Sidebar Enter` | Files: cd / open here · Sessions: resume · Commands: submit |
-| `Sidebar Space` | Files: insert *relative* path · Commands: insert (no submit) |
-| `F6 Space` | Insert *absolute* path |
-| `Drag border` | Resize sidebar / bottom pane |
-| `Shift + drag` | Native terminal text select (for copy) |
+| `F1` | Подсказка (полная карта клавиш) |
+| `F2` | Новая вкладка |
+| `F3` | Панель сессий |
+| `F4` | Панель команд Claude |
+| `F5` | Переключить глубокий grep (в сессиях) |
+| `F6` | Файловый проводник (модальный, вся ФС) |
+| `F7` | Переключить режим мыши (off = нативное выделение текста) |
+| `F8` | Закрыть активную вкладку (последняя не закрывается) |
+| `F9` | Палитра команд |
+| `F10` / `Ctrl+Q` | Выход |
+| `F11` / `F12` | Предыдущая / следующая вкладка |
+| `Ctrl+B` | Панель файлов (chroot в cwd вкладки) |
+| `` Ctrl+` `` | Нижняя shell-панель |
+| `Esc` (в боковой панели / снизу) | Снять фокус — панель остаётся, клавиши уходят в claude |
+| `Alt+1..9` | Переключиться на вкладку N |
+| `Alt+T` / `Alt+W` | Новая / закрыть вкладку |
+| `Sidebar Enter` | Файлы: cd / открыть · Сессии: возобновить · Команды: отправить |
+| `Sidebar Space` | Файлы: вставить *относительный* путь · Команды: вставить (без отправки) |
+| `F6 Space` | Вставить *абсолютный* путь |
+| `Тянуть границу` | Изменить размер боковой / нижней панели |
+| `Shift + drag` | Нативное выделение текста (для копирования) |
 
-## Configuration
+## Конфигурация
 
-Configuration lives at `~/.cmux/config.toml` (created with defaults on first launch).
+Конфигурация — в `~/.cmux/config.toml` (создаётся с дефолтами при первом запуске).
 
 ```toml
 [layout]
-sidebar_width = 42         # left sidebar (Sessions/Commands)
-right_sidebar_width = 42   # right sidebar (Files)
-bottom_height = 12         # bottom shell pane
+sidebar_width = 42         # левая панель (Sessions/Commands)
+right_sidebar_width = 42   # правая панель (Files)
+bottom_height = 12         # нижняя shell-панель
 
 [browser]
-show_hidden = false        # show .git, .claude etc. in file browser
+show_hidden = false        # показывать .git, .claude и т.п. в файловом браузере
 
 [shell]
-# Override the bottom-pane shell. Empty = autodetect from parent process.
+# Переопределение шелла для нижней панели. Пусто = автодетект из родительского процесса.
 exe = ""
 args = []
-# Example:
+# Пример:
 # exe = "pwsh.exe"
 # args = ["-NoLogo"]
 ```
 
-After editing the config, press `F9 → ★ Reload config` to apply without restart.
-Some settings (scrollback size, the bottom shell) only take effect for newly-spawned panes.
+После правки конфига нажмите `F9 → ★ Reload config`, чтобы применить без перезапуска.
+Некоторые настройки (размер scrollback, нижний шелл) применяются только для новых панелей.
 
-## Persistent layout
+## Сохраняемый layout
 
-Each time you open/close a tab, the current state is written to `~/.cmux/layout.json` (tab cwds + resolved session IDs).
-On startup the file is loaded but **not** restored automatically — open the command palette (`F9`) and pick
-**★ Restore previous layout** to bring it back.
+При каждом открытии/закрытии вкладки текущее состояние пишется в `~/.cmux/layout.json` (cwd
+вкладок + разрешённые session ID). При старте файл загружается, но **не** восстанавливается
+автоматически — откройте палитру команд (`F9`) и выберите **★ Restore previous layout**.
 
-## Activity indicators
+## Индикаторы активности
 
-In the tab bar, after the tab title:
+В баре вкладок, после заголовка:
 
-- **`●` (yellow)** — recent output, the embedded `claude` is streaming.
-- **`!` (red, blinking)** — text on screen matches a permission prompt (`do you want to`, `approve`, `allow this tool`, `(y/n)`) — Claude is waiting for you.
-- **nothing** — idle.
+- **`●` (жёлтый)** — недавний вывод, встроенный `claude` стримит.
+- **`!` (красный, мигающий)** — на экране совпадение с запросом разрешения (`do you want to`, `approve`, `allow this tool`, `(y/n)`) — Claude ждёт вас.
+- **ничего** — простаивает.
 
-Run five tabs in parallel, and switch to whichever one lights up red.
+Запустите пять вкладок параллельно и переключайтесь на ту, что загорается красным.
 
-## How it works (load-bearing pieces)
+## Как это работает (несущие конструкции)
 
-- Each tab spawns `cmd.exe /c claude.cmd` (with optional `--resume <id>`) inside a real PTY (`portable-pty`), so Claude's TUI renders exactly as it would in a regular terminal.
-- The PTY output flows through a `vt100` parser into a `tui-term` widget rendered by `ratatui`.
-- A scrollback buffer (10k lines) is owned by us, so wheel/PgUp/PgDn scroll back through history without going to the underlying app.
-- Deep-grep runs in a background thread that streams hits over an `mpsc` channel; cancellation is automatic when the query changes.
-- Parent shell for the bottom pane is detected via `sysinfo` (PID of our parent process → image name → known shell).
+- Каждая вкладка запускает `cmd.exe /c claude.cmd` (с опциональным `--resume <id>`) внутри настоящего PTY (`portable-pty`), так что TUI Claude рендерится точно так же, как в обычном терминале.
+- Поток вывода PTY идёт через парсер `vt100` в виджет `tui-term`, рендерится через `ratatui`.
+- Буфер scrollback (10k строк) — наш, поэтому колесо/PgUp/PgDn прокручивают историю, не уходя в нижележащее приложение.
+- Глубокий grep работает в фоновом потоке, стримит совпадения через `mpsc`-канал; отмена — автоматическая при смене запроса.
+- Родительский шелл для нижней панели определяется через `sysinfo` (PID родительского процесса → имя образа → известный шелл).
 
-## Limitations / known sharp edges
+## Ограничения / известные острые углы
 
-- Windows-only tested. Other OSes are best-effort.
-- The bottom shell starts in the cwd that `cmux` was launched from — not the active tab's cwd.
-- `session_id` for *new* (non-resumed) tabs is heuristically resolved at save-time by matching tab cwd to the freshest `.jsonl` in `~/.claude/projects/`. With two tabs in the same cwd it might attribute wrongly.
-- Custom keybindings are not yet config-driven — F-keys are hardcoded.
-- If a `.jsonl` line contains a `lowercase()`-resizing character (Turkish İ, German ß), grep snippet may show the lowercased form rather than the original case.
+- Тестировался только под Windows. Другие ОС — на свой страх.
+- Нижний шелл стартует в cwd, откуда был запущен `cmux`, а не в cwd активной вкладки.
+- `session_id` для *новых* (не resumed) вкладок резолвится эвристически при сохранении: cwd вкладки сопоставляется со свежайшим `.jsonl` в `~/.claude/projects/`. Две вкладки с одинаковым cwd могут быть атрибутированы неверно.
+- Кастомные кейбинды пока не настраиваются конфигом — F-клавиши захардкожены.
+- Если строка `.jsonl` содержит символ, меняющий регистр (турецкая İ, немецкая ß), сниппет grep может показать lowercase-форму, а не оригинал.
 
-## License
+## Лицензия
 
-MIT — see [LICENSE](LICENSE).
+MIT — см. [LICENSE](LICENSE).
