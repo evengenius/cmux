@@ -103,6 +103,10 @@ enum Action {
     /// Open the broadcast modal — Enter sends the typed prompt to every
     /// chat in the active project.
     OpenBroadcast,
+    /// Read the active chat's jsonl and pop a modal with token totals.
+    ShowActiveUsage,
+    /// Open the `git diff` viewer modal for the active tab's cwd.
+    ShowGitDiff,
     ReloadConfig,
     Quit,
 }
@@ -358,6 +362,10 @@ struct ChatTab {
     /// Scrollback row cap this tab was spawned with — used to clamp the
     /// scrollbar drag math and the search jump offset.
     scrollback_max: usize,
+    /// Latest cwd seen in an OSC 7 sequence from the PTY. The main loop
+    /// drains it on every tick and updates `cwd` accordingly so the
+    /// project grouping follows shells that `cd`.
+    pending_cwd: Arc<Mutex<Option<PathBuf>>>,
     /// Completed claude turns the user hasn't seen yet — incremented on every
     /// Streaming → Idle transition that happens while the tab isn't active,
     /// reset on focus. Rendered as a `[N]` badge in the chat bar. This is a
@@ -463,12 +471,14 @@ impl ChatTab {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let text_buffer = Arc::new(Mutex::new(ScrollbackText::with_capacity(scrollback_cap)));
         let total_lines = Arc::new(AtomicUsize::new(1));
+        let pending_cwd: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let mut reader = pair.master.try_clone_reader()?;
         let parser_for_reader = parser.clone();
         let dirty_for_reader = dirty.clone();
         let activity_for_reader = last_activity.clone();
         let text_for_reader = text_buffer.clone();
         let total_for_reader = total_lines.clone();
+        let pending_cwd_for_reader = pending_cwd.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -483,6 +493,14 @@ impl ChatTab {
                             // Publish total so the main thread can size the
                             // scrollbar without locking text_buffer.
                             total_for_reader.store(t.total_lines(), Ordering::Relaxed);
+                        }
+                        // OSC 7 cwd hint — shells emit `\x1b]7;file://...\x07`
+                        // after every cd. Publish the latest into pending_cwd;
+                        // the main loop applies it and re-buckets the project.
+                        if let Some(p) = extract_osc7_path(&buf[..n]) {
+                            if let Ok(mut slot) = pending_cwd_for_reader.lock() {
+                                *slot = Some(p);
+                            }
                         }
                         dirty_for_reader.store(true, Ordering::Release);
                         if let Ok(mut t) = activity_for_reader.lock() {
@@ -510,6 +528,7 @@ impl ChatTab {
             text_buffer,
             total_lines,
             scrollback_max: scrollback_cap,
+            pending_cwd,
             unread_replies: 0,
             pinned: false,
             notified_awaiting: false,
@@ -798,6 +817,14 @@ struct App {
     confirm: ConfirmState,
     // broadcast modal — send one prompt to every chat in active project
     broadcast: BroadcastState,
+    // usage modal — shows token totals for the active chat
+    usage_open: bool,
+    usage_lines: Vec<String>,
+    // git diff modal — read-only viewer for `git diff` of active tab's cwd
+    diff_open: bool,
+    diff_lines: Vec<String>,
+    diff_scroll: usize,
+    diff_title: String,
     // named layouts in ~/.cmux/layouts/, refreshed on palette open
     layout_names: Vec<String>,
     // persisted layout (if any was found at startup)
@@ -871,6 +898,12 @@ impl App {
             save_as_error: None,
             confirm: ConfirmState::default(),
             broadcast: BroadcastState::default(),
+            usage_open: false,
+            usage_lines: Vec::new(),
+            diff_open: false,
+            diff_lines: Vec::new(),
+            diff_scroll: 0,
+            diff_title: String::new(),
             layout_names: Vec::new(),
             saved_layout: layout::load(),
             key_bindings: KeyBindings::from_config(&config.keys),
@@ -1398,6 +1431,130 @@ impl App {
         self.confirm.open = true;
     }
 
+    /// Run `git diff` synchronously in the active tab's cwd, populate the
+    /// modal's lines, and open it. `git status` is appended at the top so
+    /// the viewer also surfaces untracked / staged-but-not-diff files.
+    fn show_git_diff(&mut self) {
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        self.diff_title = format!(
+            " git diff @ {} ",
+            cwd.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_else(|| cwd.to_str().unwrap_or(""))
+        );
+        let mut lines: Vec<String> = Vec::new();
+        // First: `git status --short` so untracked / staged files are visible
+        // even if `git diff` (unstaged-only by default) is empty.
+        match std::process::Command::new("git")
+            .args(["status", "--short", "--branch"])
+            .current_dir(&cwd)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                lines.push("── git status (short) ──".into());
+                for l in String::from_utf8_lossy(&out.stdout).lines() {
+                    lines.push(l.to_string());
+                }
+                lines.push(String::new());
+            }
+            Ok(out) => {
+                lines.push(format!(
+                    "── git status failed ({}) ──",
+                    out.status.code().unwrap_or(-1)
+                ));
+                for l in String::from_utf8_lossy(&out.stderr).lines() {
+                    lines.push(l.to_string());
+                }
+            }
+            Err(e) => {
+                lines.push(format!("git not on PATH: {}", e));
+            }
+        }
+        // Then: full `git diff HEAD` so both staged and unstaged hunks appear.
+        match std::process::Command::new("git")
+            .args(["--no-pager", "diff", "--no-color", "HEAD"])
+            .current_dir(&cwd)
+            .output()
+        {
+            Ok(out) => {
+                lines.push("── git diff HEAD ──".into());
+                if out.stdout.is_empty() {
+                    lines.push(" (no diff vs HEAD) ".into());
+                } else {
+                    for l in String::from_utf8_lossy(&out.stdout).lines() {
+                        lines.push(l.to_string());
+                    }
+                }
+                if !out.stderr.is_empty() {
+                    for l in String::from_utf8_lossy(&out.stderr).lines() {
+                        lines.push(format!("err: {}", l));
+                    }
+                }
+            }
+            Err(e) => {
+                lines.push(format!("git diff failed: {}", e));
+            }
+        }
+        self.diff_lines = lines;
+        self.diff_scroll = 0;
+        self.diff_open = true;
+    }
+
+    /// Look at the active tab and find its claude jsonl on disk. Returns a
+    /// SessionMeta with token / message totals. Resolution heuristic mirrors
+    /// `save_layout`: prefer an explicit session_id, else pick the newest
+    /// jsonl in ~/.claude/projects with matching cwd and updated >= tab.
+    fn resolve_active_session(&self) -> Option<SessionMeta> {
+        let tab = self.tabs.get(self.active)?;
+        let root = sessions::claude_projects_root();
+        let all = sessions::enumerate(&root);
+        if let Some(id) = &tab.session_id {
+            return all.into_iter().find(|s| &s.id == id);
+        }
+        all.into_iter().find(|s| {
+            s.cwd == tab.cwd
+                && s.updated
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    >= tab.created_at_unix
+        })
+    }
+
+    /// Build a multi-line summary of the active chat's token usage and pop
+    /// the read-only Usage modal.
+    fn show_active_usage(&mut self) {
+        let tab_title = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        let mut lines = Vec::with_capacity(6);
+        lines.push(format!(" Active chat: {} ", tab_title));
+        match self.resolve_active_session() {
+            Some(s) => {
+                lines.push(format!(" session id: {} ", truncate(&s.id, 60)));
+                lines.push(format!(" messages: {} ", s.message_count));
+                lines.push(format!(
+                    " total tokens (input + output + cache_*): {} ",
+                    format_tokens(s.total_tokens)
+                ));
+                lines.push(format!(" jsonl: {} ", s.file_path.display()));
+            }
+            None => {
+                lines.push(" No claude jsonl found yet — chat is brand-new ".into());
+                lines.push(" or its cwd doesn't match any ~/.claude/projects entry. ".into());
+            }
+        }
+        lines.push(" Press any key to close.".into());
+        self.usage_lines = lines;
+        self.usage_open = true;
+    }
+
     /// Send `self.broadcast.input` (with a trailing `\r` so claude submits it)
     /// to every chat sharing the active project's cwd. Errors per chat are
     /// swallowed — one stuck PTY shouldn't abort the whole broadcast.
@@ -1716,6 +1873,16 @@ impl App {
             &mut items,
             "★  Broadcast prompt to all chats in active project…",
             Action::OpenBroadcast,
+        );
+        push_action(
+            &mut items,
+            "★  Show usage / token totals for active chat",
+            Action::ShowActiveUsage,
+        );
+        push_action(
+            &mut items,
+            "★  Show git diff for active chat's cwd",
+            Action::ShowGitDiff,
         );
         push_action(&mut items, "★  Close active tab", Action::CloseTab);
         push_action(&mut items, "★  Previous chat (in project)", Action::PrevTab);
@@ -2212,6 +2379,17 @@ fn relative_unix(then: u64) -> String {
     }
 }
 
+/// Compact token-count formatter: 1234567 → "1.2M", 12345 → "12.3k", 999 → "999".
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let collected: String = s.chars().take(max).collect();
     if s.chars().count() > max {
@@ -2295,6 +2473,75 @@ OPTIONS:
     -V, --version       Print version and exit",
         ver = env!("CARGO_PKG_VERSION"),
     );
+}
+
+/// Scan a chunk of PTY bytes for an OSC 7 cwd hint
+/// (`\x1b]7;file://host/path<BEL or ESC \>`) and return the parsed path.
+/// Shells emit this after every `cd` when the terminal advertises support;
+/// using it lets cmux track the chat's real cwd even when the user `cd`s
+/// inside claude / the bottom shell.
+fn extract_osc7_path(bytes: &[u8]) -> Option<PathBuf> {
+    let needle = b"\x1b]7;file://";
+    let mut search_from = 0;
+    while let Some(rel) = bytes[search_from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+    {
+        let after = &bytes[search_from + rel + needle.len()..];
+        // Skip the authority (hostname) — runs until the first `/`.
+        let Some(slash) = after.iter().position(|&b| b == b'/') else {
+            search_from += rel + needle.len();
+            continue;
+        };
+        // Path runs until BEL (0x07) or ESC (0x1b — start of ESC \ terminator).
+        let path_bytes = &after[slash..];
+        let end = path_bytes
+            .iter()
+            .position(|&b| b == 0x07 || b == 0x1b)
+            .unwrap_or(path_bytes.len());
+        if end == 0 {
+            search_from += rel + needle.len();
+            continue;
+        }
+        let raw = &path_bytes[..end];
+        // OSC 7 paths are URL-encoded. We're not running a full decoder —
+        // just turn `%20` → ' ', enough for typical Unix/Windows paths.
+        let mut decoded = String::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'%' && i + 2 < raw.len() {
+                if let (Some(h), Some(l)) =
+                    (hex_nibble(raw[i + 1]), hex_nibble(raw[i + 2]))
+                {
+                    decoded.push((h * 16 + l) as char);
+                    i += 3;
+                    continue;
+                }
+            }
+            decoded.push(raw[i] as char);
+            i += 1;
+        }
+        // Windows paths come as `file:///C:/foo` → `/C:/foo`. Strip the
+        // leading slash so PathBuf treats it as a regular drive path.
+        if cfg!(windows)
+            && decoded.len() >= 3
+            && decoded.starts_with('/')
+            && decoded.chars().nth(2) == Some(':')
+        {
+            decoded.remove(0);
+        }
+        return Some(PathBuf::from(decoded));
+    }
+    None
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Parse a config-supplied accent colour name into a ratatui Color. Unknown
@@ -2673,6 +2920,27 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
             needs_draw = true;
         }
 
+        // Drain OSC 7 cwd hints into ChatTab.cwd. Tab/project bars will
+        // pick up the new grouping next draw.
+        let mut cwd_changed = false;
+        for tab in app.tabs.iter_mut() {
+            let Some(new_cwd) = tab
+                .pending_cwd
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+            else {
+                continue;
+            };
+            if new_cwd != tab.cwd && new_cwd.exists() {
+                tab.cwd = new_cwd;
+                cwd_changed = true;
+            }
+        }
+        if cwd_changed {
+            needs_draw = true;
+        }
+
         // Recompute per-tab state. If anything changed, force redraw.
         let now = Instant::now();
         let patterns = &app.config.detect.permission_patterns;
@@ -3016,6 +3284,12 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 }
                 if app.broadcast.open {
                     render_broadcast_modal(f, f.area(), app);
+                }
+                if app.usage_open {
+                    render_usage_modal(f, f.area(), app);
+                }
+                if app.diff_open {
+                    render_diff_modal(f, f.area(), app);
                 }
             })?;
             needs_draw = false;
@@ -4016,11 +4290,17 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
                     .as_deref()
                     .map(|b| format!("·{}", truncate(b, 16)))
                     .unwrap_or_default();
+                let counts = if s.message_count > 0 || s.total_tokens > 0 {
+                    format!("  ·{}msg·{}", s.message_count, format_tokens(s.total_tokens))
+                } else {
+                    String::new()
+                };
                 let row = format!(
-                    "    ⤴  {}  ·  {}{}",
-                    truncate(&s.title, max_w.saturating_sub(28)),
+                    "    ⤴  {}  ·  {}{}{}",
+                    truncate(&s.title, max_w.saturating_sub(40)),
                     sessions::relative_time(s.updated),
                     branch,
+                    counts,
                 );
                 let style = if selected {
                     Style::default()
@@ -4035,6 +4315,104 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
         }
     }
     f.render_widget(Paragraph::new(lines), list_area);
+}
+
+// ===========================================================================
+// Git diff modal — read-only `git diff HEAD` viewer with j/k navigation and
+// hunk colouring (added → green, removed → red, hunk header → magenta).
+// ===========================================================================
+fn render_diff_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
+    let w = (full_area.width as u32 * 9 / 10).max(60) as u16;
+    let w = w.min(full_area.width);
+    let h = (full_area.height as u32 * 9 / 10).max(15) as u16;
+    let h = h.min(full_area.height);
+    let x = full_area.x + (full_area.width.saturating_sub(w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+
+    let accent = app.accent_color();
+    let title = format!(
+        "{}·  j/k scroll · g/G top/bottom · r refresh · Esc close ",
+        app.diff_title
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .style(Style::default().bg(Color::Rgb(18, 20, 22)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let visible = inner.height as usize;
+    if app.diff_scroll + visible > app.diff_lines.len() {
+        app.diff_scroll = app.diff_lines.len().saturating_sub(visible);
+    }
+    let max_w = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(visible);
+    for i in 0..visible {
+        let idx = app.diff_scroll + i;
+        let Some(raw) = app.diff_lines.get(idx) else {
+            break;
+        };
+        let trimmed = truncate(raw, max_w);
+        // Cheap diff colouring on first char.
+        let style = match raw.chars().next() {
+            Some('+') if !raw.starts_with("+++") => Style::default().fg(Color::LightGreen),
+            Some('-') if !raw.starts_with("---") => Style::default().fg(Color::LightRed),
+            Some('@') => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Some('d') if raw.starts_with("diff ") => {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            }
+            Some('i') | Some('n') | Some('+') | Some('-') if raw.starts_with("index ")
+                || raw.starts_with("new file")
+                || raw.starts_with("---")
+                || raw.starts_with("+++")
+                || raw.starts_with("deleted file") =>
+            {
+                Style::default().fg(Color::DarkGray)
+            }
+            Some('─') => Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            _ => Style::default().fg(Color::Gray),
+        };
+        lines.push(Line::from(Span::styled(trimmed, style)));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ===========================================================================
+// Usage modal — read-only token totals for the active chat.
+// ===========================================================================
+fn render_usage_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
+    let w = 80u16.min(full_area.width.saturating_sub(4));
+    let h = (app.usage_lines.len() as u16 + 3).max(7);
+    if w < 30 || full_area.height < h + 2 {
+        return;
+    }
+    let x = full_area.x + (full_area.width.saturating_sub(w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+
+    let accent = app.accent_color();
+    let block = Block::default()
+        .title(" Active chat usage  ·  any key to close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines: Vec<Line> = app
+        .usage_lines
+        .iter()
+        .map(|l| {
+            Line::from(Span::styled(l.clone(), Style::default().fg(Color::White)))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ===========================================================================
@@ -5273,11 +5651,17 @@ fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             .as_deref()
             .map(|b| format!("·{}", truncate(b, 16)))
             .unwrap_or_default();
+        let counts = if s.message_count > 0 || s.total_tokens > 0 {
+            format!("  ·{}msg·{}", s.message_count, format_tokens(s.total_tokens))
+        } else {
+            String::new()
+        };
         let meta_text = format!(
-            " {}  {}{} ",
+            " {}  {}{}{} ",
             sessions::relative_time(s.updated),
             sessions::cwd_label(&s.cwd),
             branch,
+            counts,
         );
         let meta_text = truncate(&meta_text, max_label_width);
         lines.push(Line::from(Span::styled(title_text, title_style)));
@@ -5450,6 +5834,14 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.broadcast.open = true;
             Ok(KeyOutcome::LayoutChanged)
         }
+        Action::ShowActiveUsage => {
+            app.show_active_usage();
+            Ok(KeyOutcome::LayoutChanged)
+        }
+        Action::ShowGitDiff => {
+            app.show_git_diff();
+            Ok(KeyOutcome::LayoutChanged)
+        }
         Action::Quit => Ok(KeyOutcome::Quit),
     }
 }
@@ -5524,6 +5916,48 @@ fn handle_key(
     // Broadcast modal — eats keys until Enter/Esc.
     if app.broadcast.open {
         return handle_broadcast_key(k, app);
+    }
+
+    // Usage modal — any key dismisses (read-only popup).
+    if app.usage_open {
+        app.usage_open = false;
+        app.usage_lines.clear();
+        return Ok(KeyOutcome::LayoutChanged);
+    }
+
+    // Git diff modal — Esc closes, navigation scrolls.
+    if app.diff_open {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                app.diff_open = false;
+                app.diff_lines.clear();
+                app.diff_scroll = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.diff_scroll = app.diff_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = app.diff_lines.len().saturating_sub(1);
+                app.diff_scroll = (app.diff_scroll + 1).min(max);
+            }
+            KeyCode::PageUp => {
+                app.diff_scroll = app.diff_scroll.saturating_sub(15);
+            }
+            KeyCode::PageDown => {
+                let max = app.diff_lines.len().saturating_sub(1);
+                app.diff_scroll = (app.diff_scroll + 15).min(max);
+            }
+            KeyCode::Home | KeyCode::Char('g') => app.diff_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                app.diff_scroll = app.diff_lines.len().saturating_sub(1);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                // Refresh — re-run git on the still-active tab.
+                app.show_git_diff();
+            }
+            _ => {}
+        }
+        return Ok(KeyOutcome::LayoutChanged);
     }
 
     // Shift+F3 toggles the global-sessions modal.

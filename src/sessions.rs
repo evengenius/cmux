@@ -15,6 +15,13 @@ pub struct SessionMeta {
     pub updated: SystemTime,
     pub git_branch: Option<String>,
     pub file_path: PathBuf,
+    /// Approximate message count — number of jsonl lines we successfully
+    /// parsed as objects. Cheap to compute during enumerate(); the user
+    /// trades exactness for not having to read every byte.
+    pub message_count: u32,
+    /// Sum of input + output tokens across all `usage` records in the
+    /// session's jsonl. 0 if the session never emitted usage info.
+    pub total_tokens: u64,
 }
 
 pub fn claude_projects_root() -> PathBuf {
@@ -62,23 +69,61 @@ fn parse_meta(path: &Path, id: &str, project_dir: &str) -> Option<SessionMeta> {
     let mut title: Option<String> = None;
     let mut cwd: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
+    let mut message_count: u32 = 0;
+    let mut total_tokens: u64 = 0;
 
+    // Walk the full file so message_count and total_tokens reflect the whole
+    // session. The 64-line cap used to be here to bail early after grabbing
+    // cwd/title — fine for that, but it under-counted everything else. We
+    // accept the extra read cost (jsonl is a few KB to a couple MB at most).
     let mut line = String::new();
-    let mut lines_read = 0;
-    while lines_read < 64 {
+    loop {
         line.clear();
         let n = rdr.read_line(&mut line).ok()?;
         if n == 0 {
             break;
         }
-        lines_read += 1;
-        if title.is_some() && cwd.is_some() {
-            break;
-        }
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+
+        // Token usage records — read from assistant turns.
+        if let Some(usage) = v
+            .get("message")
+            .and_then(|m| m.get("usage"))
+            .or_else(|| v.get("usage"))
+        {
+            let inp = usage
+                .get("input_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            let outp = usage
+                .get("output_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            let cache_create = usage
+                .get("cache_creation_input_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            let cache_read = usage
+                .get("cache_read_input_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            total_tokens = total_tokens
+                .saturating_add(inp)
+                .saturating_add(outp)
+                .saturating_add(cache_create)
+                .saturating_add(cache_read);
+        }
+
+        // Count "real" messages — user prompts and assistant turns. Internal
+        // tool-use / system entries don't count for the badge.
+        let typ = v.get("type").and_then(|t| t.as_str());
+        if matches!(typ, Some("user") | Some("assistant")) {
+            message_count = message_count.saturating_add(1);
+        }
+
+        if typ != Some("user") {
             continue;
         }
         if cwd.is_none() {
@@ -122,6 +167,8 @@ fn parse_meta(path: &Path, id: &str, project_dir: &str) -> Option<SessionMeta> {
         updated,
         git_branch: branch,
         file_path: path.to_path_buf(),
+        message_count,
+        total_tokens,
     })
 }
 
