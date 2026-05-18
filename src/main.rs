@@ -1,10 +1,13 @@
 mod browser;
+mod commands;
 mod config;
 mod grep;
 mod layout;
 mod notify;
 mod sessions;
 mod shell;
+
+use commands::{CommandEntry, CommandSource};
 
 use std::{
     io::{Read, Write},
@@ -513,6 +516,7 @@ struct App {
     // mouse drag state
     resize_drag: ResizeDrag,
     // commands sidebar
+    commands_list: Vec<CommandEntry>,
     commands_filtered: Vec<usize>,
     // help overlay
     help_open: bool,
@@ -564,7 +568,8 @@ impl App {
             sidebar_area: Rect::default(),
             body_bottom_y: 0,
             resize_drag: ResizeDrag::None,
-            commands_filtered: (0..CLAUDE_COMMANDS.len()).collect(),
+            commands_list: Vec::new(),
+            commands_filtered: Vec::new(),
             help_open: false,
             saved_layout: layout::load(),
             config: config::load(),
@@ -674,19 +679,32 @@ impl App {
         self.sidebar_idx = 0;
         self.sidebar_scroll = 0;
         self.filter.clear();
+        self.reload_commands();
         self.apply_commands_filter();
+    }
+
+    /// Rebuild `commands_list` from project-local + user-global `.claude/commands/*.md`
+    /// plus the hardcoded built-ins. Called on every F4 open so project-local
+    /// edits take effect without restart.
+    fn reload_commands(&mut self) {
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        self.commands_list = commands::load(&cwd, CLAUDE_COMMANDS);
     }
 
     fn apply_commands_filter(&mut self) {
         let q = self.filter.to_lowercase();
         self.commands_filtered = if q.is_empty() {
-            (0..CLAUDE_COMMANDS.len()).collect()
+            (0..self.commands_list.len()).collect()
         } else {
-            CLAUDE_COMMANDS
+            self.commands_list
                 .iter()
                 .enumerate()
-                .filter_map(|(i, (name, desc))| {
-                    if name.to_lowercase().contains(&q) || desc.to_lowercase().contains(&q) {
+                .filter_map(|(i, e)| {
+                    if e.name.to_lowercase().contains(&q) || e.desc.to_lowercase().contains(&q) {
                         Some(i)
                     } else {
                         None
@@ -2251,7 +2269,7 @@ fn render_commands_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let count_text = format!(
         " {} of {}  ·  Enter submit · Space insert ",
         app.commands_filtered.len(),
-        CLAUDE_COMMANDS.len()
+        app.commands_list.len()
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2285,7 +2303,7 @@ fn render_commands_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let Some(&c_idx) = app.commands_filtered.get(f_idx) else {
             break;
         };
-        let (name, desc) = CLAUDE_COMMANDS[c_idx];
+        let entry = &app.commands_list[c_idx];
         let selected = f_idx == app.sidebar_idx;
         let name_style = if selected {
             Style::default()
@@ -2300,12 +2318,28 @@ fn render_commands_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        lines.push(Line::from(Span::styled(
-            format!(" {} ", truncate(name, max_w.saturating_sub(2))),
+        let badge = entry.source.badge();
+        let mut name_line: Vec<Span> = Vec::with_capacity(2);
+        name_line.push(Span::styled(
+            format!(" {} ", truncate(&entry.name, max_w.saturating_sub(2 + badge.len() + 3))),
             name_style,
-        )));
+        ));
+        if !badge.is_empty() {
+            let badge_color = match entry.source {
+                CommandSource::Project => Color::Cyan,
+                CommandSource::User => Color::Magenta,
+                CommandSource::BuiltIn => Color::DarkGray,
+            };
+            let badge_style = if selected {
+                Style::default().bg(Color::Yellow).fg(badge_color)
+            } else {
+                Style::default().fg(badge_color)
+            };
+            name_line.push(Span::styled(format!(" [{}]", badge), badge_style));
+        }
+        lines.push(Line::from(name_line));
         lines.push(Line::from(Span::styled(
-            format!(" {} ", truncate(desc, max_w.saturating_sub(2))),
+            format!(" {} ", truncate(&entry.desc, max_w.saturating_sub(2))),
             desc_style,
         )));
     }
@@ -2343,14 +2377,14 @@ fn handle_commands_sidebar_key(
         KeyCode::End => app.sidebar_idx = app.commands_filtered.len().saturating_sub(1),
         KeyCode::Enter => {
             if let Some(&c_idx) = app.commands_filtered.get(app.sidebar_idx) {
-                let (name, _) = CLAUDE_COMMANDS[c_idx];
+                let name = app.commands_list[c_idx].name.clone();
                 let payload = format!("{}\r", name);
                 app.active_tab().write_input(payload.as_bytes())?;
             }
         }
         KeyCode::Char(' ') => {
             if let Some(&c_idx) = app.commands_filtered.get(app.sidebar_idx) {
-                let (name, _) = CLAUDE_COMMANDS[c_idx];
+                let name = app.commands_list[c_idx].name.clone();
                 let payload = format!("{} ", name);
                 app.active_tab().write_input(payload.as_bytes())?;
             }
