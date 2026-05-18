@@ -33,8 +33,15 @@ pub fn osc_notify(title: &str, body: &str) {
 /// POST a JSON `{title, body, tab, cwd}` payload to `url` via background
 /// curl. Fire-and-forget — failures are silent so a misconfigured webhook
 /// never disrupts the TUI.
+///
+/// Security: URL is **validated** to start with `http://` or `https://` so a
+/// config value containing curl flags or weird schemes can't smuggle in
+/// arbitrary behaviour (`--upload-file …` would otherwise let an attacker
+/// exfiltrate files). We also pass `--` before the URL so curl treats it
+/// strictly as a positional argument.
 pub fn webhook(url: &str, title: &str, body: &str, tab: &str, cwd: &str) {
-    if url.trim().is_empty() {
+    let url = url.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
         return;
     }
     let payload = serde_json::json!({
@@ -55,6 +62,7 @@ pub fn webhook(url: &str, title: &str, body: &str, tab: &str, cwd: &str) {
         "@-",
         "--max-time",
         "5",
+        "--",
     ])
     .arg(url)
     .stdin(std::process::Stdio::piped())
@@ -70,9 +78,11 @@ pub fn webhook(url: &str, title: &str, body: &str, tab: &str, cwd: &str) {
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(payload.as_bytes());
-        // dropping stdin closes it so curl sees EOF
     }
-    // Don't wait — we don't care about the result and don't want to block.
+    // Reap in a detached thread so POSIX doesn't accumulate zombies.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 fn sanitise(s: &str) -> String {

@@ -122,6 +122,9 @@ enum Action {
     ReopenLastClosed,
     /// Insert snippet number `n` (index into the sorted snippets list) into
     /// the active chat's input. No trailing `\r` — the user submits.
+    /// Insert snippet by `snippet_*` index into `App.snippet_keys` — a
+    /// cached, sorted copy of the config snippet names. Resolving by name
+    /// (not raw position) keeps the binding stable across config reloads.
     InsertSnippet(usize),
     /// Export a Markdown summary of the active chat's session to
     /// `<cwd>/sessions/<ts>-<slug>.md`. Inspired by iannuttall/claude-sessions.
@@ -875,6 +878,10 @@ struct App {
     config: config::Config,
     // user-defined keymap from `[keys]` section, rebuilt on reload.
     key_bindings: KeyBindings,
+    /// Snapshot of snippet names taken when the palette is built. Used to
+    /// resolve `InsertSnippet(i)` so a config reload between palette-open
+    /// and item-select doesn't shift indices under us.
+    snippet_keys: Vec<String>,
 }
 
 impl App {
@@ -950,6 +957,7 @@ impl App {
             layout_names: Vec::new(),
             saved_layout: layout::load(),
             key_bindings: KeyBindings::from_config(&config.keys),
+            snippet_keys: Vec::new(),
             config,
         })
     }
@@ -1045,13 +1053,14 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("chat");
         let branch = worktree::pick_branch(&repo, &self.config.git.branch_prefix, slug);
-        // Worktree dir: <root>/<slug>-<unix>. Always unique enough.
+        // Worktree dir: <root>/<slug>-<unix-nanos>. Nanos so two F2 presses
+        // in the same second can't collide on disk.
         let leaf = format!(
             "{}-{}",
             slug,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
+                .map(|d| d.as_nanos())
                 .unwrap_or(0)
         );
         let root = if Path::new(&self.config.git.worktree_root).is_absolute() {
@@ -1099,15 +1108,19 @@ impl App {
 
     /// Run `git worktree remove --force` for a closed tab if (a) cmux owned
     /// the worktree, (b) config asks for removal, and (c) the tab wasn't
-    /// pinned. Errors are swallowed — leftover worktrees can be cleaned by
-    /// `git worktree prune` later.
+    /// pinned. Spawned in a detached thread so the TUI never blocks on git
+    /// (a big worktree with untracked files can take seconds to remove,
+    /// and `close_project` may close N tabs at once).
     fn maybe_remove_worktree(&self, tab: &ChatTab) {
         if !self.config.git.remove_on_close || tab.pinned {
             return;
         }
-        if let Some((repo, wt)) = &tab.worktree_owned {
-            let _ = worktree::remove(repo, wt);
-        }
+        let Some((repo, wt)) = tab.worktree_owned.clone() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let _ = worktree::remove(&repo, &wt);
+        });
     }
 
     /// Pop the most-recently-closed chat and spawn it back. Falls back to
@@ -1610,7 +1623,9 @@ impl App {
     }
 
     /// Write a Markdown summary of the active chat's session to
-    /// `<cwd>/sessions/YYYY-MM-DD-HHMM-<slug>.md`. Surface success/failure
+    /// `<cwd>/sessions/YYYY-MM-DD-HHMM-<slug>.md` — or, when the chat lives
+    /// inside a cmux-owned worktree (which gets deleted on close), to
+    /// `~/.cmux/sessions/` so the note survives. Surface success/failure
     /// via the usage modal.
     fn export_session_note(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else {
@@ -1618,7 +1633,16 @@ impl App {
         };
         let cwd = tab.cwd.clone();
         let title = tab.title.clone();
-        let dir = cwd.join("sessions");
+        // If this chat's cwd is a cmux-managed worktree, exporting INTO it
+        // means the file vanishes on close. Redirect to ~/.cmux/sessions/.
+        let dir = if tab.worktree_owned.is_some() {
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_default();
+            PathBuf::from(home).join(".cmux").join("sessions")
+        } else {
+            cwd.join("sessions")
+        };
         if let Err(e) = std::fs::create_dir_all(&dir) {
             self.usage_lines = vec![format!(" create dir failed: {} ", e)];
             self.usage_open = true;
@@ -2239,9 +2263,14 @@ impl App {
             "★  Export session note (Markdown → <cwd>/sessions/)",
             Action::ExportSessionNote,
         );
-        for (i, (name, text)) in self.config.snippets.iter().enumerate() {
+        // Refresh the snippet-name snapshot every palette rebuild so
+        // `InsertSnippet(i)` resolves through this stable vec instead of
+        // the live `config.snippets` map that may reshuffle on reload.
+        self.snippet_keys = self.config.snippets.keys().cloned().collect();
+        for (i, name) in self.snippet_keys.iter().enumerate() {
+            let text = self.config.snippets.get(name).cloned().unwrap_or_default();
             let preview = text.chars().take(40).collect::<String>();
-            let label = format!("✎  Insert snippet: {} — {}", name, preview);
+            let label = format!("★  Insert snippet: {} — {}", name, preview);
             items.push(PaletteItem {
                 label: label.clone(),
                 hay: format!("snippet {} {}", name.to_lowercase(), text.to_lowercase()),
@@ -3591,6 +3620,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
         let webhook_url = app.config.notify.webhook.clone();
         let mut fired_bell = false;
         let mut fired_osc = false;
+        let mut fired_webhook = false;
         let active_idx = app.active;
         for (i, &state) in states.iter().enumerate() {
             let prev = app.last_states.get(i).copied().unwrap_or(TabState::Idle);
@@ -3621,7 +3651,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                             "claude is waiting on a permission prompt",
                         );
                     }
-                    if !webhook_url.is_empty() {
+                    if !webhook_url.is_empty() && !fired_webhook {
                         notify::webhook(
                             &webhook_url,
                             &format!("{} needs you", tab.title),
@@ -3629,6 +3659,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                             &tab.title,
                             &tab.cwd.to_string_lossy(),
                         );
+                        fired_webhook = true;
                     }
                 }
                 TabState::Idle | TabState::Streaming => {
@@ -6521,16 +6552,17 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             Ok(KeyOutcome::LayoutChanged)
         }
         Action::InsertSnippet(idx) => {
-            let Some((_, text)) = app
-                .config
-                .snippets
-                .iter()
-                .nth(idx)
-                .map(|(k, v)| (k.clone(), v.clone()))
-            else {
+            // Resolve via the cached name snapshot, then look up the body
+            // in the (possibly-reloaded) config. Strip `\r` so an
+            // accidentally-Windows-line-ended snippet doesn't auto-submit.
+            let Some(name) = app.snippet_keys.get(idx).cloned() else {
                 return Ok(KeyOutcome::Continue);
             };
-            app.active_tab().write_input(text.as_bytes())?;
+            let Some(text) = app.config.snippets.get(&name).cloned() else {
+                return Ok(KeyOutcome::Continue);
+            };
+            let safe: String = text.chars().filter(|c| *c != '\r').collect();
+            app.active_tab().write_input(safe.as_bytes())?;
             Ok(KeyOutcome::Continue)
         }
         Action::ExportSessionNote => {
