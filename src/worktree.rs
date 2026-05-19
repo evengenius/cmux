@@ -169,10 +169,13 @@ pub fn find_orphans(
             if !p.is_dir() {
                 continue;
             }
-            // A real cmux worktree contains a `.git` file (worktree marker).
-            // Skip anything that doesn't look like a git worktree so we
-            // can't blow up unrelated user-created dirs.
-            if !p.join(".git").exists() {
+            // A git WORKTREE has `.git` as a regular FILE containing
+            // `gitdir: ...`. A plain clone has `.git` as a directory; a
+            // submodule has the gitdir file too but lives inside its parent
+            // repo. We only delete things that look exactly like worktrees
+            // so we can't nuke a foreign clone the user happens to have
+            // under our scan root.
+            if !is_worktree_marker(&p) {
                 continue;
             }
             // Compare via canonical-ish form so symlink/case differences
@@ -183,6 +186,23 @@ pub fn find_orphans(
         }
     }
     out
+}
+
+/// True only if `dir/.git` is a regular file starting with `gitdir:` —
+/// the worktree marker format. Rejects plain repos (`.git` is a dir) and
+/// random dirs with a `.git` of any other shape.
+fn is_worktree_marker(dir: &Path) -> bool {
+    let marker = dir.join(".git");
+    let Ok(meta) = std::fs::metadata(&marker) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    let Ok(s) = std::fs::read_to_string(&marker) else {
+        return false;
+    };
+    s.trim_start().starts_with("gitdir:")
 }
 
 fn paths_equal(a: &Path, b: &Path) -> bool {
@@ -196,25 +216,50 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
 }
 
 /// Force-remove a worktree from its repo. Used by `--prune-worktrees` to
-/// discard orphans. Tries the recorded repo if known, else falls back to
-/// running `git worktree remove --force` from the worktree path itself
-/// (git resolves the repo).
+/// discard orphans. Tries `git worktree remove --force .` from the worktree
+/// path itself (git resolves the repo from the `.git` file). If git
+/// refuses, falls back to `remove_dir_all` and surfaces git's stderr in
+/// the error so the user knows what they're losing.
+///
+/// After a successful remove (either path), also calls
+/// `git -C <repo> worktree prune` on the parent repo (resolved from the
+/// `.git` marker) so dangling metadata doesn't accumulate.
 pub fn force_remove(worktree_dir: &Path) -> Result<(), String> {
-    // Inside a valid worktree, `git rev-parse --show-superproject-working-tree`
-    // or `--git-common-dir` resolves the main repo. Simplest: run remove with
-    // `current_dir = worktree_dir` — git figures it out from the `.git` file.
+    let parent_repo = parent_repo_of_worktree(worktree_dir);
     let out = Command::new("git")
         .args(["worktree", "remove", "--force", "."])
         .current_dir(worktree_dir)
         .output()
         .map_err(|e| format!("spawn git failed: {}", e))?;
     if !out.status.success() {
-        // Fallback: blow away the directory directly. The git metadata in the
-        // parent repo will then be cleaned by `git worktree prune` next run.
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         std::fs::remove_dir_all(worktree_dir)
-            .map_err(|e| format!("rm -rf failed: {}", e))?;
+            .map_err(|e| format!("git refused ({}) and rm -rf failed: {}", stderr, e))?;
+        // Tell the user what git refused even though we steamrolled it.
+        eprintln!("note: git declined ({}); removed the dir anyway", stderr);
+    }
+    if let Some(repo) = parent_repo {
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(repo)
+            .output();
     }
     Ok(())
+}
+
+/// Read `<dir>/.git` (worktree marker) and resolve the parent repo's main
+/// git dir, then walk up to its working tree. Returns None if anything
+/// looks off (caller falls back to "just don't prune").
+fn parent_repo_of_worktree(worktree_dir: &Path) -> Option<PathBuf> {
+    let marker = worktree_dir.join(".git");
+    let s = std::fs::read_to_string(&marker).ok()?;
+    let rest = s.trim().strip_prefix("gitdir:")?.trim();
+    // `gitdir: /abs/path/to/repo/.git/worktrees/<name>` →
+    // repo working tree is the dir whose `.git` dir contains this.
+    let gitdir = PathBuf::from(rest);
+    // Walk up: .git/worktrees/<name> → .git → repo root.
+    let repo_git = gitdir.parent()?.parent()?;
+    repo_git.parent().map(|p| p.to_path_buf())
 }
 
 #[cfg(test)]

@@ -1141,11 +1141,14 @@ impl App {
         let scrollback = self.config.layout.scrollback_lines;
         // If the chat lived in a cmux-owned worktree that has since been
         // removed, fall back to the repo root so claude doesn't spawn in a
-        // ghost directory.
+        // ghost directory. Also drop session_id because claude indexes
+        // sessions by cwd hash — the old session lives under the worktree's
+        // hash and won't be found from the repo root.
         if let Some((repo, wt)) = &c.worktree_owned {
             if !wt.exists() {
                 c.cwd = repo.clone();
                 c.worktree_owned = None;
+                c.session_id = None;
             }
         }
         // Title was already truncated when the snapshot was taken; don't
@@ -2595,9 +2598,22 @@ impl App {
         }
         let scrollback = self.config.layout.scrollback_lines;
         for st in &saved.tabs {
-            let mut tab = match &st.session_id {
+            // If the saved cwd was a cmux worktree that no longer exists
+            // (e.g. removed while cmux was off), fall back to the repo root
+            // and drop the session_id (claude indexes by cwd-hash).
+            let mut cwd = st.cwd.clone();
+            let mut session_id = st.session_id.clone();
+            let mut worktree_owned = st.worktree_owned.clone();
+            if let Some((repo, wt)) = &worktree_owned {
+                if !wt.exists() {
+                    cwd = repo.clone();
+                    session_id = None;
+                    worktree_owned = None;
+                }
+            }
+            let mut tab = match &session_id {
                 Some(id) => ChatTab::spawn_resume(
-                    st.cwd.clone(),
+                    cwd,
                     id,
                     truncate(&st.title, 24),
                     rows,
@@ -2605,7 +2621,7 @@ impl App {
                     scrollback,
                 )?,
                 None => ChatTab::spawn_with_title(
-                    st.cwd.clone(),
+                    cwd,
                     truncate(&st.title, 24),
                     rows,
                     cols,
@@ -2613,7 +2629,7 @@ impl App {
                 )?,
             };
             tab.pinned = st.pinned;
-            tab.worktree_owned = st.worktree_owned.clone();
+            tab.worktree_owned = worktree_owned;
             self.tabs.push(tab);
         }
         self.active = saved.active.min(self.tabs.len().saturating_sub(1));
@@ -2834,8 +2850,12 @@ struct CliArgs {
     /// `--doctor` — print diagnostics and exit (no TUI).
     doctor: bool,
     /// `--prune-worktrees` — scan known layouts, find cmux-managed
-    /// worktrees no live/saved tab references, remove them, exit.
+    /// worktrees no live/saved tab references, list them. Dry-run by
+    /// default; pair with `--force` to actually delete.
     prune_worktrees: bool,
+    /// `--force` — required by `--prune-worktrees` to actually delete.
+    /// Without it, prune is a list-only dry run.
+    force: bool,
 }
 
 fn parse_args() -> std::result::Result<CliArgs, String> {
@@ -2865,6 +2885,9 @@ fn parse_args() -> std::result::Result<CliArgs, String> {
             }
             "--prune-worktrees" => {
                 out.prune_worktrees = true;
+            }
+            "--force" => {
+                out.force = true;
             }
             s if s.starts_with("--") => return Err(format!("unknown flag: {}", s)),
             s => {
@@ -2896,9 +2919,11 @@ OPTIONS:
     --resume ID         Resume the given claude session id in the first tab
     --continue          Spawn the first tab with `claude --continue`
     --doctor            Print diagnostics (paths, versions, config) and exit
-    --prune-worktrees   Remove cmux-managed git worktrees no live/saved tab
-                        references (orphans from crashes). Reports each
-                        action and exits.
+    --prune-worktrees   List cmux-managed git worktrees no live/saved tab
+                        references (orphans from crashes). Dry-run by
+                        default — re-run with --force to actually delete.
+                        Deleted paths are also logged to ~/.cmux/pruned-*.log.
+    --force             Required by --prune-worktrees to actually delete.
     -h, --help          Print this help and exit
     -V, --version       Print version and exit",
         ver = env!("CARGO_PKG_VERSION"),
@@ -3388,8 +3413,10 @@ fn collect_known_worktrees() -> std::collections::HashSet<PathBuf> {
 }
 
 /// `--prune-worktrees` entry point: enumerate cmux-managed worktrees that
-/// no saved tab references, remove them, print a report, exit.
-fn run_prune_worktrees() {
+/// no saved tab references. Dry-run by default — list only — unless `--force`
+/// is also passed. On `--force`, also writes a pruned-log to ~/.cmux/ so the
+/// destructive action is recoverable in audit terms.
+fn run_prune_worktrees(force: bool) {
     let cfg = config::load();
     let known = collect_known_worktrees();
 
@@ -3445,6 +3472,27 @@ fn run_prune_worktrees() {
         return;
     }
     println!("cmux: found {} orphan worktree(s):", orphans.len());
+    for p in &orphans {
+        println!("  {}", p.display());
+    }
+    if !force {
+        println!();
+        println!(
+            "cmux: dry-run (default). Re-run with --force to delete.\n      \
+             Tip: copy/move anything you want to keep first."
+        );
+        return;
+    }
+
+    // Force path: do it, log it.
+    let log_path = pruned_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut log_lines = vec![format!(
+        "# cmux --prune-worktrees --force at {}\n",
+        chrono_like_stamp()
+    )];
     let mut removed = 0;
     let mut failed = 0;
     for path in &orphans {
@@ -3452,20 +3500,33 @@ fn run_prune_worktrees() {
         match worktree::force_remove(path) {
             Ok(()) => {
                 println!("ok");
+                log_lines.push(format!("removed: {}", path.display()));
                 removed += 1;
             }
             Err(e) => {
                 println!("FAIL: {}", e);
+                log_lines.push(format!("failed:  {}  ({})", path.display(), e));
                 failed += 1;
             }
         }
     }
+    let _ = std::fs::write(&log_path, log_lines.join("\n"));
     println!(
-        "cmux: done. removed {}, failed {} (of {}).",
+        "cmux: done. removed {}, failed {} (of {}). log: {}",
         removed,
         failed,
-        orphans.len()
+        orphans.len(),
+        log_path.display()
     );
+}
+
+fn pruned_log_path() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    PathBuf::from(home)
+        .join(".cmux")
+        .join(format!("pruned-{}.log", chrono_like_stamp()))
 }
 
 /// Print a diagnostics dump (config, layouts, claude binary, terminal env)
@@ -3599,7 +3660,7 @@ fn main() -> Result<()> {
         std::process::exit(0);
     }
     if args.prune_worktrees {
-        run_prune_worktrees();
+        run_prune_worktrees(args.force);
         std::process::exit(0);
     }
 
