@@ -3137,6 +3137,88 @@ fn last_assistant_text(path: &Path) -> std::io::Result<String> {
     Ok(last)
 }
 
+/// Append a paste payload to the active modal's text input, if any. Returns
+/// true when the paste was consumed by a modal (caller skips PTY forward).
+///
+/// Sanitises by stripping ASCII control bytes (\r, \n, ESC, BEL, etc.) so
+/// a pasted blob can't auto-submit a half-typed field — except inside the
+/// broadcast modal where the user is composing a prompt and may legitimately
+/// want newlines in their content (they're sent only on Enter, not via
+/// embedded \r).
+fn route_paste_to_modal(payload: &str, app: &mut App) -> bool {
+    let sanitise = |s: &str, allow_newlines: bool| -> String {
+        s.chars()
+            .filter(|c| {
+                if allow_newlines && (*c == '\n' || *c == '\t') {
+                    return true;
+                }
+                !c.is_control()
+            })
+            .collect()
+    };
+    if app.rename_open {
+        let clean = sanitise(payload, false);
+        let room = 60usize.saturating_sub(app.rename_input.chars().count());
+        let take: String = clean.chars().take(room).collect();
+        app.rename_input.push_str(&take);
+        return true;
+    }
+    if app.save_as_open {
+        let clean = sanitise(payload, false);
+        let room = 60usize.saturating_sub(app.save_as_input.chars().count());
+        let take: String = clean.chars().take(room).collect();
+        app.save_as_input.push_str(&take);
+        app.save_as_error = None;
+        return true;
+    }
+    if app.broadcast.open {
+        // Broadcast is the only "prompt-style" modal — keep newlines so
+        // multi-line pastes work. The actual submit is on Enter; embedded
+        // \n stays as visible text in the input (preview).
+        let clean = sanitise(payload, true);
+        app.broadcast.input.push_str(&clean);
+        return true;
+    }
+    if app.search.open {
+        let clean = sanitise(payload, false);
+        app.search.query.push_str(&clean);
+        app.search_rerun();
+        return true;
+    }
+    if app.global_sessions.open {
+        let clean = sanitise(payload, false);
+        app.global_sessions.filter.push_str(&clean);
+        app.rebuild_global_entries();
+        return true;
+    }
+    if app.help_open {
+        let clean = sanitise(payload, false);
+        app.help_filter.push_str(&clean);
+        return true;
+    }
+    if app.palette_open {
+        let clean = sanitise(payload, false);
+        app.palette_query.push_str(&clean);
+        app.apply_palette_filter();
+        return true;
+    }
+    if app.sidebar_open && app.sidebar_focused {
+        let clean = sanitise(payload, false);
+        app.filter.push_str(&clean);
+        match app.sidebar_mode {
+            SidebarMode::Sessions => app.apply_filter(),
+            SidebarMode::Commands => app.apply_commands_filter(),
+        }
+        return true;
+    }
+    // Confirm modal and usage/diff modals are read-only — swallow without
+    // doing anything so a fat-fingered paste doesn't fall through to PTY.
+    if app.confirm.open || app.usage_open || app.diff_open {
+        return true;
+    }
+    false
+}
+
 /// Scan a chunk of PTY bytes for an OSC 7 cwd hint
 /// (`\x1b]7;file://host/path<BEL or ESC \>`) and return the parsed path.
 /// Shells emit this after every `cd` when the terminal advertises support;
@@ -4450,21 +4532,36 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                     applied_pty_size = None;
                 }
                 Event::Paste(s) => {
-                    // Forward as bracketed paste so the inner program treats it
-                    // as a single chunk (no premature Enter on newlines).
-                    let mut bytes = Vec::with_capacity(s.len() + 12);
-                    bytes.extend_from_slice(b"\x1b[200~");
-                    bytes.extend_from_slice(s.as_bytes());
-                    bytes.extend_from_slice(b"\x1b[201~");
-                    if app.bottom_open && app.bottom_focused {
+                    // Route the paste to whichever text-input has focus: an
+                    // open modal beats the PTY (otherwise pasting into a
+                    // rename / save-as / broadcast input would silently
+                    // dump the text behind the modal into claude). Modals
+                    // that are read-only or yes/no swallow the paste.
+                    if route_paste_to_modal(&s, app) {
+                        // consumed by a modal; rebuild any derived state
+                        // (search re-runs, sidebar filter re-applies).
+                        needs_draw = true;
+                    } else if app.bottom_open && app.bottom_focused {
+                        // Forward as bracketed paste so the inner shell
+                        // treats it as one atomic chunk.
+                        let mut bytes = Vec::with_capacity(s.len() + 12);
+                        bytes.extend_from_slice(b"\x1b[200~");
+                        bytes.extend_from_slice(s.as_bytes());
+                        bytes.extend_from_slice(b"\x1b[201~");
                         if let Some(bt) = app.bottom.as_mut() {
                             bt.write_input(&bytes)?;
                         }
+                        needs_draw = true;
                     } else {
+                        // Default: bracketed paste straight to claude.
+                        let mut bytes = Vec::with_capacity(s.len() + 12);
+                        bytes.extend_from_slice(b"\x1b[200~");
+                        bytes.extend_from_slice(s.as_bytes());
+                        bytes.extend_from_slice(b"\x1b[201~");
                         app.active_tab().scroll_reset();
                         app.active_tab().write_input(&bytes)?;
+                        needs_draw = true;
                     }
-                    needs_draw = true;
                 }
                 _ => {}
             }
