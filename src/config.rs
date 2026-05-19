@@ -353,13 +353,16 @@ remove_on_close = true
 #   commit = "Commit changes with a clear conventional commit message."
 "#;
 
-pub fn ensure_default_written() {
+/// Returns `true` if a fresh default config was written on this call —
+/// i.e., it's a first run. Used to auto-pop F1 the first time the user
+/// launches cmux.
+pub fn ensure_default_written() -> bool {
     let path = config_path();
     if path.exists() {
-        return;
+        return false;
     }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, DEFAULT_TOML);
+    std::fs::write(path, DEFAULT_TOML).is_ok()
 }

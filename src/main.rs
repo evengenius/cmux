@@ -62,6 +62,8 @@ const NEW_TAB_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
 /// Max gap between two left-button-down events on the same chat that still
 /// counts as a double-click (close-the-tab gesture).
 const DOUBLE_CLICK_MS: u128 = 500;
+/// How long a status-line alert stays visible before auto-dismissing.
+const ALERT_TTL: Duration = Duration::from_secs(4);
 const SCROLL_STEP: usize = 3;
 // Defaults live in config::LayoutConfig::default; overridable via ~/.cmux/config.toml
 
@@ -852,6 +854,9 @@ struct App {
     commands_filtered: Vec<usize>,
     // help overlay
     help_open: bool,
+    /// Live search filter inside the F1 help overlay — narrows shortcut
+    /// rows that match the substring in either key or description.
+    help_filter: String,
     // scrollback search (Ctrl+F)
     search: SearchState,
     // global sessions modal (Shift+F3)
@@ -887,6 +892,17 @@ struct App {
     /// resolve `InsertSnippet(i)` so a config reload between palette-open
     /// and item-select doesn't shift indices under us.
     snippet_keys: Vec<String>,
+    /// Transient status message — shows in the bottom info slot for
+    /// `ALERT_TTL` after being set. Used for "copied", "exported",
+    /// "webhook failed", etc.
+    alert: Option<(String, Instant, AlertKind)>,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum AlertKind {
+    Info,
+    Warn,
+    Error,
 }
 
 impl App {
@@ -944,6 +960,7 @@ impl App {
             commands_list: Vec::new(),
             commands_filtered: Vec::new(),
             help_open: false,
+            help_filter: String::new(),
             search: SearchState::default(),
             global_sessions: GlobalSessionsState::default(),
             rename_open: false,
@@ -963,8 +980,24 @@ impl App {
             saved_layout: layout::load(),
             key_bindings: KeyBindings::from_config(&config.keys),
             snippet_keys: Vec::new(),
+            alert: None,
             config,
         })
+    }
+
+    /// Push a transient status message into the bottom-bar slot. Displays
+    /// for ALERT_TTL then auto-clears.
+    fn set_alert(&mut self, kind: AlertKind, msg: impl Into<String>) {
+        self.alert = Some((msg.into(), Instant::now(), kind));
+    }
+
+    /// Drop the alert if it's older than ALERT_TTL. Called every poll.
+    fn expire_alert(&mut self) {
+        if let Some((_, when, _)) = &self.alert {
+            if when.elapsed() >= ALERT_TTL {
+                self.alert = None;
+            }
+        }
     }
 
     fn active_tab(&mut self) -> &mut ChatTab {
@@ -1694,12 +1727,17 @@ impl App {
         let body = build_session_markdown(&title, &cwd, session.as_ref());
         match std::fs::write(&path, body) {
             Ok(()) => {
+                self.set_alert(
+                    AlertKind::Info,
+                    format!("✓ session note → {}", path.display()),
+                );
                 self.usage_lines = vec![
                     " Session note written: ".into(),
                     format!(" {} ", path.display()),
                 ];
             }
             Err(e) => {
+                self.set_alert(AlertKind::Error, format!("export failed: {}", e));
                 self.usage_lines = vec![format!(" write failed: {} ", e)];
             }
         }
@@ -1767,17 +1805,29 @@ impl App {
     }
 
     /// Shared "copy and report" helper for the two clipboard actions above.
-    fn copy_to_clipboard_msg(&self, text: &str, label: &str) -> Vec<String> {
+    /// Also pushes a transient status-line alert so the user gets feedback
+    /// without keeping the usage modal up.
+    fn copy_to_clipboard_msg(&mut self, text: &str, label: &str) -> Vec<String> {
         if text.is_empty() {
+            self.set_alert(AlertKind::Warn, format!("{} is empty", label));
             return vec![format!(" nothing to copy: {} is empty ", label)];
         }
         let chars = text.chars().count();
         match clipboard::copy(text) {
-            Ok(backend) => vec![
-                format!(" Copied {} chars to clipboard ({}) ", chars, backend),
-                format!(" source: {} ", label),
-            ],
-            Err(e) => vec![format!(" Copy failed: {} ", e)],
+            Ok(backend) => {
+                self.set_alert(
+                    AlertKind::Info,
+                    format!("✓ copied {} ({} chars via {})", label, chars, backend),
+                );
+                vec![
+                    format!(" Copied {} chars to clipboard ({}) ", chars, backend),
+                    format!(" source: {} ", label),
+                ]
+            }
+            Err(e) => {
+                self.set_alert(AlertKind::Error, format!("copy failed: {}", e));
+                vec![format!(" Copy failed: {} ", e)]
+            }
         }
     }
 
@@ -3387,6 +3437,76 @@ fn open_url_inner(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Path to the cmux instance lockfile (`~/.cmux/.lock`). Contains the PID
+/// of the first cmux instance that grabbed it; lets `--prune-worktrees
+/// --force` refuse to run while another cmux may have unsaved worktrees.
+fn lockfile_path() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    PathBuf::from(home).join(".cmux").join(".lock")
+}
+
+/// Try to acquire the cmux lock. Returns `Ok(())` if we own it now;
+/// `Err(pid)` if a live cmux owns it (PID still alive). Stale lockfiles
+/// (process gone) are overwritten.
+fn acquire_lock() -> std::result::Result<(), u32> {
+    let path = lockfile_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if let Ok(pid) = existing.trim().parse::<u32>() {
+            if pid_is_alive(pid) && pid != std::process::id() {
+                return Err(pid);
+            }
+        }
+    }
+    let _ = std::fs::write(&path, std::process::id().to_string());
+    Ok(())
+}
+
+fn release_lock() {
+    let path = lockfile_path();
+    // Only delete if it still claims our PID — defensive against another
+    // process having taken over.
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        if s.trim() == std::process::id().to_string() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Cheap PID liveness check. Doesn't try to identify the process — just
+/// whether the OS still has it. Used to invalidate stale lockfiles.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        // `tasklist /FI "PID eq <pid>" /NH` prints "INFO: No tasks..." when
+        // there's no match; otherwise a line containing the PID.
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .output();
+        if let Ok(o) = out {
+            let s = String::from_utf8_lossy(&o.stdout);
+            return s.contains(&pid.to_string());
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        // POSIX: kill(pid, 0) returns 0 if process exists. Use `kill -0`
+        // shell since we don't want a libc dependency.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
 /// Collect all worktree paths cmux knows are still in use: the auto-saved
 /// layout's tabs plus every named layout's tabs. The active session has no
 /// state on disk at startup, so the union of layouts is the best we can do
@@ -3660,7 +3780,25 @@ fn main() -> Result<()> {
         std::process::exit(0);
     }
     if args.prune_worktrees {
+        // Refuse the destructive path if another cmux instance might be
+        // holding live worktrees that aren't yet in any saved layout.
+        if args.force {
+            if let Err(pid) = acquire_lock() {
+                eprintln!(
+                    "cmux: refusing to --prune-worktrees --force while another \
+                     cmux is running (pid {pid}).\n      \
+                     Close the other instance, or wait — your live worktrees \
+                     could be deleted as orphans.\n      \
+                     Use --prune-worktrees (no --force) for a safe dry-run.",
+                    pid = pid
+                );
+                std::process::exit(2);
+            }
+        }
         run_prune_worktrees(args.force);
+        if args.force {
+            release_lock();
+        }
         std::process::exit(0);
     }
 
@@ -3674,7 +3812,11 @@ fn main() -> Result<()> {
         std::process::exit(127);
     }
 
-    config::ensure_default_written();
+    let first_run = config::ensure_default_written();
+    // Grab the instance lock so concurrent `--prune-worktrees --force`
+    // refuses to delete worktrees this cmux owns. Stale locks (process
+    // gone) are overwritten, so a crashed previous run doesn't wedge us.
+    let _ = acquire_lock();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(
@@ -3717,6 +3859,12 @@ fn main() -> Result<()> {
         let _ = app.restore_layout(pty_rows, pty_cols);
     }
 
+    // First-run welcome: auto-pop the help overlay so a brand-new user
+    // sees the keymap instead of an empty PTY.
+    if first_run {
+        app.help_open = true;
+    }
+
     let result = run(&mut terminal, &mut app);
 
     app.save_layout();
@@ -3729,6 +3877,7 @@ fn main() -> Result<()> {
         DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
+    release_lock();
     result
 }
 
@@ -3750,6 +3899,12 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
         app.cleanup_dead();
         if app.tabs.is_empty() {
             return Ok(());
+        }
+        // Auto-clear stale status alerts so they don't linger.
+        let had_alert = app.alert.is_some();
+        app.expire_alert();
+        if had_alert && app.alert.is_none() {
+            needs_draw = true;
         }
 
         // Apply pending mouse-capture mode change
@@ -4118,10 +4273,33 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                     }
                 }
 
-                let info_tag = if scroll_off > 0 {
-                    Some(format!("SCROLL -{}", scroll_off))
+                // Bottom-bar right slot: alert wins over scroll/mouse tags
+                // so transient confirmations are seen. AlertKind drives
+                // colour: Info=green, Warn=yellow, Error=red.
+                let info_tag: Option<(String, Style)> = if let Some((msg, _, kind)) = &app.alert {
+                    let style = match kind {
+                        AlertKind::Info => Style::default().bg(Color::Green).fg(Color::Black),
+                        AlertKind::Warn => Style::default().bg(Color::Yellow).fg(Color::Black),
+                        AlertKind::Error => Style::default().bg(Color::Red).fg(Color::White),
+                    }
+                    .add_modifier(Modifier::BOLD);
+                    Some((format!(" {} ", truncate(msg, 70)), style))
+                } else if scroll_off > 0 {
+                    Some((
+                        format!(" SCROLL -{} ", scroll_off),
+                        Style::default()
+                            .bg(Color::Yellow)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    ))
                 } else if !app.mouse_on {
-                    Some("MOUSE OFF · Shift+select".to_string())
+                    Some((
+                        " MOUSE OFF · Shift+select ".to_string(),
+                        Style::default()
+                            .bg(Color::Yellow)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    ))
                 } else {
                     None
                 };
@@ -4130,7 +4308,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                     render_bottom_pane(f, area, app);
                 }
 
-                let (line, hits) = render_button_bar(chunks[3], app, info_tag.as_deref());
+                let (line, hits) = render_button_bar(chunks[3], app, info_tag.as_ref());
                 app.button_hits = hits;
                 f.render_widget(
                     Paragraph::new(line).style(Style::default().bg(Color::DarkGray)),
@@ -4152,7 +4330,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                     render_palette(f, f.area(), app);
                 }
                 if app.help_open {
-                    render_help(f, f.area());
+                    render_help(f, f.area(), &app.help_filter);
                 }
                 if app.global_sessions.open {
                     render_global_sessions(f, f.area(), app);
@@ -4352,6 +4530,12 @@ fn render_chat_bar(
     let mut spans: Vec<Span> = Vec::new();
     let mut rects: Vec<(Rect, usize)> = Vec::with_capacity(chat_indices.len());
     let mut x = area.x;
+    // Reserve room on the right for `+` + 1 cell of breathing room + possible
+    // `›` overflow indicator. Beyond this we stop rendering chats so the
+    // `+` button never gets pushed off-screen.
+    let right_reserve: u16 = 5; // " + " (3) + space + possible "›"
+    let limit_x = area.x.saturating_add(area.width).saturating_sub(right_reserve);
+    let mut overflow = false;
 
     for (display_pos, &global_idx) in chat_indices.iter().enumerate() {
         let t = &tabs[global_idx];
@@ -4390,6 +4574,12 @@ fn render_chat_bar(
         let dot_w = dot.map(|s| s.chars().count() as u16).unwrap_or(0);
         let badge_w = badge.as_ref().map(|s| s.chars().count() as u16).unwrap_or(0);
         let total_w = label_w + dot_w + badge_w;
+        // Bail when the next chat would overflow the available width;
+        // surface a `›` marker after the loop so the user knows.
+        if x.saturating_add(total_w) > limit_x {
+            overflow = true;
+            break;
+        }
 
         let label_style = if is_active {
             Style::default()
@@ -4425,6 +4615,17 @@ fn render_chat_bar(
             global_idx,
         ));
         x = x.saturating_add(total_w + 1);
+    }
+
+    if overflow {
+        spans.push(Span::styled(
+            " › ",
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        x = x.saturating_add(3);
     }
 
     let plus = " + ";
@@ -4544,8 +4745,16 @@ fn handle_broadcast_key(k: crossterm::event::KeyEvent, app: &mut App) -> Result<
             return Ok(KeyOutcome::LayoutChanged);
         }
         KeyCode::Enter => {
-            let _ = app.apply_broadcast();
+            let sent = app.apply_broadcast();
             app.broadcast.clear();
+            if sent > 0 {
+                app.set_alert(
+                    AlertKind::Info,
+                    format!("✓ broadcast sent to {} chat(s)", sent),
+                );
+            } else {
+                app.set_alert(AlertKind::Warn, "broadcast: 0 chats matched");
+            }
             return Ok(KeyOutcome::LayoutChanged);
         }
         KeyCode::Backspace if app.broadcast.input.pop().is_some() => {}
@@ -5985,7 +6194,7 @@ fn render_bottom_pane(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 // ===========================================================================
 // Help overlay
 // ===========================================================================
-fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
+fn render_help(f: &mut ratatui::Frame, full_area: Rect, filter: &str) {
     let w = (full_area.width as u32 * 7 / 10).max(60) as u16;
     let w = w.min(full_area.width);
     let h = (full_area.height as u32 * 8 / 10).max(20) as u16;
@@ -5997,12 +6206,31 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
     f.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" Help  ·  Esc / F1 close ")
+        .title(" Help  ·  type to filter · Ctrl+U clear · Esc / F1 close ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::Rgb(20, 20, 24)));
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    // Filter input row above the table.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+    let filter_line = Line::from(vec![
+        Span::styled(
+            " / ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(filter.to_string(), Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(filter_line).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        chunks[0],
+    );
+    let inner = chunks[1];
 
     let pairs: &[(&str, &str)] = &[
         ("F1",            "Help (this overlay)"),
@@ -6049,8 +6277,12 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
     ];
 
     let max_left = pairs.iter().map(|(k, _)| k.len()).max().unwrap_or(10);
+    let q = filter.to_lowercase();
     let lines: Vec<Line> = pairs
         .iter()
+        .filter(|(k, v)| {
+            q.is_empty() || k.to_lowercase().contains(&q) || v.to_lowercase().contains(&q)
+        })
         .map(|(k, v)| {
             Line::from(vec![
                 Span::raw(" "),
@@ -6063,7 +6295,17 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
             ])
         })
         .collect();
-    f.render_widget(Paragraph::new(lines), inner);
+    if lines.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " (no shortcuts match) ",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            inner,
+        );
+    } else {
+        f.render_widget(Paragraph::new(lines), inner);
+    }
 }
 
 // ===========================================================================
@@ -6072,7 +6314,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect) {
 fn render_button_bar(
     area: Rect,
     app: &App,
-    info: Option<&str>,
+    info: Option<&(String, Style)>,
 ) -> (Line<'static>, Vec<ButtonHit>) {
     // (label, action, is_active). F9 is its own slot — uses a sentinel action
     // we map below since we don't want a "TogglePalette" Action variant.
@@ -6129,20 +6371,14 @@ fn render_button_bar(
         x = x.saturating_add(width + 1);
     }
 
-    // Right-aligned info tag, if it fits.
-    if let Some(text) = info {
-        let label = format!(" {} ", text);
-        let w = label.chars().count() as u16;
+    // Right-aligned info tag, if it fits. Caller chose the style so alerts
+    // (green/yellow/red) and scroll/mouse hints (yellow) share this slot.
+    if let Some((text, style)) = info {
+        let w = text.chars().count() as u16;
         if x.saturating_add(w + 1) <= limit {
             let pad = limit - x - w;
             spans.push(Span::raw(" ".repeat(pad as usize)));
-            spans.push(Span::styled(
-                label,
-                Style::default()
-                    .bg(Color::Yellow)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled(text.clone(), *style));
         }
     }
 
@@ -6720,6 +6956,8 @@ fn execute_action(action: Action, app: &mut App, pty_area: Rect) -> Result<KeyOu
             app.broadcast.open = true;
             Ok(KeyOutcome::LayoutChanged)
         }
+        // Trick: there's no broadcast-done action; apply_broadcast is called
+        // from handle_broadcast_key. We surface the alert there.
         Action::ShowActiveUsage => {
             app.show_active_usage();
             Ok(KeyOutcome::LayoutChanged)
@@ -6794,13 +7032,24 @@ fn handle_key(
         return execute_action(Action::ToggleHelp, app, pty_area);
     }
 
-    // While help overlay is shown, swallow keys (Esc/F1 closes via above)
+    // While help overlay is shown, swallow keys (Esc/F1 closes via above);
+    // typing narrows a live filter on the shortcut list.
     if app.help_open {
-        if k.code == KeyCode::Esc {
-            app.help_open = false;
-            return Ok(KeyOutcome::LayoutChanged);
+        let ctrl_h = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => {
+                app.help_open = false;
+                app.help_filter.clear();
+                return Ok(KeyOutcome::LayoutChanged);
+            }
+            KeyCode::Backspace if app.help_filter.pop().is_some() => {}
+            KeyCode::Char('u') if ctrl_h => app.help_filter.clear(),
+            KeyCode::Char(c) if !ctrl_h => {
+                app.help_filter.push(c);
+            }
+            _ => {}
         }
-        return Ok(KeyOutcome::Continue);
+        return Ok(KeyOutcome::LayoutChanged);
     }
 
     // User-defined keybindings from `[keys]` — checked before the hardcoded
