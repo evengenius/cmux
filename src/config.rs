@@ -355,7 +355,9 @@ remove_on_close = true
 
 /// Returns `true` if a fresh default config was written on this call —
 /// i.e., it's a first run. Used to auto-pop F1 the first time the user
-/// launches cmux.
+/// launches cmux. On write failure (permissions / disk full) prints a
+/// warning to stderr so the user knows config persistence won't work,
+/// and returns false (no welcome triggered).
 pub fn ensure_default_written() -> bool {
     let path = config_path();
     if path.exists() {
@@ -364,5 +366,16 @@ pub fn ensure_default_written() -> bool {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(path, DEFAULT_TOML).is_ok()
+    match std::fs::write(&path, DEFAULT_TOML) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "cmux: warning — couldn't write default config to {}: {}\n      \
+                 (running with built-in defaults; settings won't persist)",
+                path.display(),
+                e
+            );
+            false
+        }
+    }
 }

@@ -1413,6 +1413,11 @@ impl App {
 
     fn toggle_help(&mut self) {
         self.help_open = !self.help_open;
+        if !self.help_open {
+            // Clear the filter so re-opening starts fresh instead of
+            // landing the user back on a stale-and-empty result list.
+            self.help_filter.clear();
+        }
     }
 
     fn toggle_files_sidebar(&mut self) {
@@ -3437,73 +3442,103 @@ fn open_url_inner(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Path to the cmux instance lockfile (`~/.cmux/.lock`). Contains the PID
-/// of the first cmux instance that grabbed it; lets `--prune-worktrees
-/// --force` refuse to run while another cmux may have unsaved worktrees.
-fn lockfile_path() -> PathBuf {
+/// Path to the cmux instance lockfile (`~/.cmux/.lock`). Returns None when
+/// neither USERPROFILE nor HOME is set — refusing to write a lock into the
+/// current working dir is safer than producing many per-cwd "locks" that
+/// don't mutually exclude.
+fn lockfile_path() -> Option<PathBuf> {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    PathBuf::from(home).join(".cmux").join(".lock")
+        .ok()?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".cmux").join(".lock"))
 }
 
-/// Try to acquire the cmux lock. Returns `Ok(())` if we own it now;
-/// `Err(pid)` if a live cmux owns it (PID still alive). Stale lockfiles
-/// (process gone) are overwritten.
+/// Lockfile body: PID plus a process-launch-time tag so PID recycling can't
+/// give a stale lock false authority. Format: `<pid> <tag>` on one line.
+/// `tag` is the executable name on Windows (`tasklist` reports it cheaply)
+/// or the `/proc/<pid>/stat` start-time field elsewhere — anything that
+/// changes if the OS hands the same PID to a different process.
+fn process_tag(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        // tasklist /FI "PID eq <pid>" /FO CSV /NH → `"image","pid",...`.
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout);
+        let first_line = s.lines().next()?.trim();
+        if !first_line.starts_with('"') {
+            return None;
+        }
+        // Image name is the first CSV field.
+        let image = first_line.split("\",\"").next()?.trim_start_matches('"');
+        Some(image.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        // Linux: /proc/<pid>/stat — field 22 is starttime. On macOS the file
+        // doesn't exist; fall back to "alive" (just the PID — best effort).
+        let path = format!("/proc/{}/stat", pid);
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            // Last `)` separates the comm (which may contain spaces) from
+            // the rest. Field positions are 1-indexed from after `)`.
+            let after = s.rsplit_once(')').map(|(_, r)| r).unwrap_or(&s);
+            let parts: Vec<&str> = after.split_whitespace().collect();
+            // starttime is field 22 in the original stat layout; after the
+            // `)` split it's index 19 (state at 0).
+            if let Some(start) = parts.get(19) {
+                return Some(format!("start:{}", start));
+            }
+        }
+        None
+    }
+}
+
+/// Try to acquire the cmux lock. Returns `Ok(())` on success, `Err(pid)`
+/// when a live cmux still owns it. Stale locks (process gone OR PID
+/// recycled into a different process) are overwritten.
 fn acquire_lock() -> std::result::Result<(), u32> {
-    let path = lockfile_path();
+    let Some(path) = lockfile_path() else {
+        return Ok(()); // no HOME → opt-out, not silent breakage
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(existing) = std::fs::read_to_string(&path) {
-        if let Ok(pid) = existing.trim().parse::<u32>() {
-            if pid_is_alive(pid) && pid != std::process::id() {
+        let mut parts = existing.trim().splitn(2, ' ');
+        if let Some(Ok(pid)) = parts.next().map(|s| s.parse::<u32>()) {
+            let recorded_tag = parts.next().unwrap_or("").trim();
+            let live_tag = process_tag(pid).unwrap_or_default();
+            let same_proc = !live_tag.is_empty() && live_tag == recorded_tag;
+            if same_proc && pid != std::process::id() {
                 return Err(pid);
             }
         }
     }
-    let _ = std::fs::write(&path, std::process::id().to_string());
+    let me = std::process::id();
+    let my_tag = process_tag(me).unwrap_or_default();
+    let _ = std::fs::write(&path, format!("{} {}", me, my_tag));
     Ok(())
 }
 
 fn release_lock() {
-    let path = lockfile_path();
+    let Some(path) = lockfile_path() else {
+        return;
+    };
     // Only delete if it still claims our PID — defensive against another
     // process having taken over.
     if let Ok(s) = std::fs::read_to_string(&path) {
-        if s.trim() == std::process::id().to_string() {
+        let pid_str = s.split_whitespace().next().unwrap_or("");
+        if pid_str == std::process::id().to_string() {
             let _ = std::fs::remove_file(&path);
         }
-    }
-}
-
-/// Cheap PID liveness check. Doesn't try to identify the process — just
-/// whether the OS still has it. Used to invalidate stale lockfiles.
-fn pid_is_alive(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        // `tasklist /FI "PID eq <pid>" /NH` prints "INFO: No tasks..." when
-        // there's no match; otherwise a line containing the PID.
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-            .output();
-        if let Ok(o) = out {
-            let s = String::from_utf8_lossy(&o.stdout);
-            return s.contains(&pid.to_string());
-        }
-        false
-    }
-    #[cfg(not(windows))]
-    {
-        // POSIX: kill(pid, 0) returns 0 if process exists. Use `kill -0`
-        // shell since we don't want a libc dependency.
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
     }
 }
 
@@ -4530,10 +4565,10 @@ fn render_chat_bar(
     let mut spans: Vec<Span> = Vec::new();
     let mut rects: Vec<(Rect, usize)> = Vec::with_capacity(chat_indices.len());
     let mut x = area.x;
-    // Reserve room on the right for `+` + 1 cell of breathing room + possible
-    // `›` overflow indicator. Beyond this we stop rendering chats so the
-    // `+` button never gets pushed off-screen.
-    let right_reserve: u16 = 5; // " + " (3) + space + possible "›"
+    // Reserve room on the right for the `+` button and a possible `›`
+    // overflow indicator. " + " (3 cells) + " › " (3 cells) = 6 cells —
+    // never push the `+` past the bar's edge even at the worst case.
+    let right_reserve: u16 = 6;
     let limit_x = area.x.saturating_add(area.width).saturating_sub(right_reserve);
     let mut overflow = false;
 
