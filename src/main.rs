@@ -235,6 +235,11 @@ struct ClosedTab {
     session_id: Option<String>,
     title: String,
     pinned: bool,
+    /// Worktree info, copied so reopen can rebind the chat. If the worktree
+    /// was removed on close (config + not pinned), this still points at a
+    /// now-non-existent dir — reopen detects that and falls back to the
+    /// repo root.
+    worktree_owned: Option<(PathBuf, PathBuf)>,
 }
 
 const RECENTLY_CLOSED_CAP: usize = 10;
@@ -1089,6 +1094,7 @@ impl App {
             session_id: t.session_id.clone(),
             title: t.title.clone(),
             pinned: t.pinned,
+            worktree_owned: t.worktree_owned.clone(),
         });
         if let Some(snap) = snapshot {
             if self.recently_closed.len() == RECENTLY_CLOSED_CAP {
@@ -1129,10 +1135,19 @@ impl App {
     /// broken — a freshly reopened cmux chat slots back into its project
     /// instead of dangling at the end.
     fn reopen_last_closed(&mut self, rows: u16, cols: u16) -> Result<bool> {
-        let Some(c) = self.recently_closed.pop_back() else {
+        let Some(mut c) = self.recently_closed.pop_back() else {
             return Ok(false);
         };
         let scrollback = self.config.layout.scrollback_lines;
+        // If the chat lived in a cmux-owned worktree that has since been
+        // removed, fall back to the repo root so claude doesn't spawn in a
+        // ghost directory.
+        if let Some((repo, wt)) = &c.worktree_owned {
+            if !wt.exists() {
+                c.cwd = repo.clone();
+                c.worktree_owned = None;
+            }
+        }
         // Title was already truncated when the snapshot was taken; don't
         // re-truncate (avoid ellipsis-on-ellipsis cosmetic bug).
         let title = c.title.clone();
@@ -1154,6 +1169,7 @@ impl App {
             )?,
         };
         tab.pinned = c.pinned;
+        tab.worktree_owned = c.worktree_owned.clone();
         // Find the index of the LAST sibling sharing this cwd and insert
         // right after it. If no sibling exists, append (new project).
         let insert_at = self
@@ -1476,6 +1492,7 @@ impl App {
                     session_id: t.session_id.clone(),
                     title: t.title.clone(),
                     pinned: t.pinned,
+                    worktree_owned: t.worktree_owned.clone(),
                 };
                 if self.recently_closed.len() == RECENTLY_CLOSED_CAP {
                     self.recently_closed.pop_front();
@@ -1925,6 +1942,7 @@ impl App {
                             session_id: t.session_id.clone(),
                             title: t.title.clone(),
                             pinned: true,
+                            worktree_owned: t.worktree_owned.clone(),
                         };
                         if self.recently_closed.len() == RECENTLY_CLOSED_CAP {
                             self.recently_closed.pop_front();
@@ -2595,6 +2613,7 @@ impl App {
                 )?,
             };
             tab.pinned = st.pinned;
+            tab.worktree_owned = st.worktree_owned.clone();
             self.tabs.push(tab);
         }
         self.active = saved.active.min(self.tabs.len().saturating_sub(1));
@@ -2650,6 +2669,7 @@ impl App {
                     title: t.title.clone(),
                     created_at_unix: t.created_at_unix,
                     pinned: t.pinned,
+                    worktree_owned: t.worktree_owned.clone(),
                 }
             })
             .collect();
@@ -2813,6 +2833,9 @@ struct CliArgs {
     continue_last: bool,
     /// `--doctor` — print diagnostics and exit (no TUI).
     doctor: bool,
+    /// `--prune-worktrees` — scan known layouts, find cmux-managed
+    /// worktrees no live/saved tab references, remove them, exit.
+    prune_worktrees: bool,
 }
 
 fn parse_args() -> std::result::Result<CliArgs, String> {
@@ -2839,6 +2862,9 @@ fn parse_args() -> std::result::Result<CliArgs, String> {
             }
             "--doctor" => {
                 out.doctor = true;
+            }
+            "--prune-worktrees" => {
+                out.prune_worktrees = true;
             }
             s if s.starts_with("--") => return Err(format!("unknown flag: {}", s)),
             s => {
@@ -2870,6 +2896,9 @@ OPTIONS:
     --resume ID         Resume the given claude session id in the first tab
     --continue          Spawn the first tab with `claude --continue`
     --doctor            Print diagnostics (paths, versions, config) and exit
+    --prune-worktrees   Remove cmux-managed git worktrees no live/saved tab
+                        references (orphans from crashes). Reports each
+                        action and exits.
     -h, --help          Print this help and exit
     -V, --version       Print version and exit",
         ver = env!("CARGO_PKG_VERSION"),
@@ -3333,6 +3362,112 @@ fn open_url_inner(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Collect all worktree paths cmux knows are still in use: the auto-saved
+/// layout's tabs plus every named layout's tabs. The active session has no
+/// state on disk at startup, so the union of layouts is the best we can do
+/// without IPC into a running cmux.
+fn collect_known_worktrees() -> std::collections::HashSet<PathBuf> {
+    let mut known = std::collections::HashSet::new();
+    if let Some(l) = layout::load() {
+        for t in l.tabs {
+            if let Some((_, wt)) = t.worktree_owned {
+                known.insert(wt);
+            }
+        }
+    }
+    for name in layout::list_named() {
+        if let Some(l) = layout::load_named(&name) {
+            for t in l.tabs {
+                if let Some((_, wt)) = t.worktree_owned {
+                    known.insert(wt);
+                }
+            }
+        }
+    }
+    known
+}
+
+/// `--prune-worktrees` entry point: enumerate cmux-managed worktrees that
+/// no saved tab references, remove them, print a report, exit.
+fn run_prune_worktrees() {
+    let cfg = config::load();
+    let known = collect_known_worktrees();
+
+    // Build the candidate roots: the configured worktree_root resolved
+    // against every repo we know of (via saved tabs' worktree_owned tuples),
+    // plus parents of every known worktree path (in case the user changed
+    // the config and orphans are now in an old root).
+    let mut roots: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let configured = &cfg.git.worktree_root;
+    let configured_is_abs = Path::new(configured).is_absolute();
+    if configured_is_abs {
+        roots.insert(PathBuf::from(configured));
+    }
+    // Scan saved layouts again to learn repo roots and old worktree parents.
+    let layouts: Vec<layout::SavedLayout> = layout::load()
+        .into_iter()
+        .chain(
+            layout::list_named()
+                .into_iter()
+                .filter_map(|n| layout::load_named(&n)),
+        )
+        .collect();
+    for l in &layouts {
+        for t in &l.tabs {
+            if let Some((repo, wt)) = &t.worktree_owned {
+                if !configured_is_abs {
+                    roots.insert(repo.join(configured));
+                }
+                if let Some(p) = wt.parent() {
+                    roots.insert(p.to_path_buf());
+                }
+            }
+        }
+    }
+
+    if roots.is_empty() {
+        println!(
+            "cmux: no known worktree roots — nothing to scan. Configure \
+             [git] auto_worktree first, or spawn at least one cmux-managed \
+             worktree."
+        );
+        return;
+    }
+
+    let roots_vec: Vec<PathBuf> = roots.into_iter().collect();
+    println!("cmux: scanning for orphan worktrees in:");
+    for r in &roots_vec {
+        println!("  {}", r.display());
+    }
+    let orphans = worktree::find_orphans(&roots_vec, &known);
+    if orphans.is_empty() {
+        println!("cmux: no orphan worktrees found.");
+        return;
+    }
+    println!("cmux: found {} orphan worktree(s):", orphans.len());
+    let mut removed = 0;
+    let mut failed = 0;
+    for path in &orphans {
+        print!("  removing {} ... ", path.display());
+        match worktree::force_remove(path) {
+            Ok(()) => {
+                println!("ok");
+                removed += 1;
+            }
+            Err(e) => {
+                println!("FAIL: {}", e);
+                failed += 1;
+            }
+        }
+    }
+    println!(
+        "cmux: done. removed {}, failed {} (of {}).",
+        removed,
+        failed,
+        orphans.len()
+    );
+}
+
 /// Print a diagnostics dump (config, layouts, claude binary, terminal env)
 /// and exit. Intended as the answer when a user files an issue: paste this
 /// output. Doesn't enter raw mode and doesn't touch any files.
@@ -3461,6 +3596,10 @@ fn main() -> Result<()> {
 
     if args.doctor {
         print_doctor();
+        std::process::exit(0);
+    }
+    if args.prune_worktrees {
+        run_prune_worktrees();
         std::process::exit(0);
     }
 

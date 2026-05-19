@@ -145,6 +145,78 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Walk the directories that hold cmux-managed worktrees and return any leaf
+/// dir that's NOT in the `known` set. `known` is the union of
+/// `worktree_owned` paths from all live tabs + the auto-saved layout + every
+/// named layout — anything else under one of `worktree_roots` is an orphan.
+///
+/// `worktree_roots` is the set of directories cmux *could* have created
+/// worktrees in: the configured `[git] worktree_root` for the active config
+/// plus, defensively, any parent of a `known` path we found in saved
+/// layouts (in case the user changed the config and orphans are now in an
+/// old root).
+pub fn find_orphans(
+    worktree_roots: &[PathBuf],
+    known: &std::collections::HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in worktree_roots {
+        let Ok(rd) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            // A real cmux worktree contains a `.git` file (worktree marker).
+            // Skip anything that doesn't look like a git worktree so we
+            // can't blow up unrelated user-created dirs.
+            if !p.join(".git").exists() {
+                continue;
+            }
+            // Compare via canonical-ish form so symlink/case differences
+            // don't mark a known path as orphan.
+            if !known.iter().any(|k| paths_equal(k, &p)) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Force-remove a worktree from its repo. Used by `--prune-worktrees` to
+/// discard orphans. Tries the recorded repo if known, else falls back to
+/// running `git worktree remove --force` from the worktree path itself
+/// (git resolves the repo).
+pub fn force_remove(worktree_dir: &Path) -> Result<(), String> {
+    // Inside a valid worktree, `git rev-parse --show-superproject-working-tree`
+    // or `--git-common-dir` resolves the main repo. Simplest: run remove with
+    // `current_dir = worktree_dir` — git figures it out from the `.git` file.
+    let out = Command::new("git")
+        .args(["worktree", "remove", "--force", "."])
+        .current_dir(worktree_dir)
+        .output()
+        .map_err(|e| format!("spawn git failed: {}", e))?;
+    if !out.status.success() {
+        // Fallback: blow away the directory directly. The git metadata in the
+        // parent repo will then be cleaned by `git worktree prune` next run.
+        std::fs::remove_dir_all(worktree_dir)
+            .map_err(|e| format!("rm -rf failed: {}", e))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

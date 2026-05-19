@@ -32,6 +32,12 @@ pub struct SavedTab {
     /// stays pinned across cmux restarts.
     #[serde(default)]
     pub pinned: bool,
+    /// (repo_root, worktree_path) when this chat was spawned into a cmux-
+    /// managed git worktree. Persisted so close-time cleanup can find the
+    /// worktree even across cmux restarts, and so `cmux --prune-worktrees`
+    /// can tell live worktrees apart from orphans.
+    #[serde(default)]
+    pub worktree_owned: Option<(PathBuf, PathBuf)>,
 }
 
 pub fn layout_path() -> PathBuf {
