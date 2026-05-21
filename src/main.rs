@@ -2913,6 +2913,16 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// Standard dim hint-line used at the bottom of every modal. Centralising
+/// it guarantees the same colour, leading space, and trailing space so the
+/// user reads the same row for shortcuts no matter which modal is open.
+fn hint_line(text: &str) -> Paragraph<'_> {
+    Paragraph::new(Line::from(Span::styled(
+        text,
+        Style::default().fg(theme::theme().fg_dim),
+    )))
+}
+
 // ===========================================================================
 // CLI args
 // ===========================================================================
@@ -4377,7 +4387,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                         .style(if scroll_off > 0 {
                             Style::default().fg(Color::Yellow)
                         } else {
-                            Style::default().fg(Color::DarkGray)
+                            Style::default().fg(theme::theme().fg_dim)
                         });
                     f.render_stateful_widget(bar, sb_area, &mut state);
 
@@ -5366,7 +5376,7 @@ fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[0],
     );
@@ -5490,7 +5500,7 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             count_text,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[1],
     );
@@ -5503,7 +5513,7 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
             " (no matches) "
         };
         f.render_widget(
-            Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(msg).style(Style::default().fg(theme::theme().fg_dim)),
             list_area,
         );
         return;
@@ -5624,7 +5634,7 @@ fn render_diff_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
                 || raw.starts_with("+++")
                 || raw.starts_with("deleted file") =>
             {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme::theme().fg_dim)
             }
             Some('─') => Style::default().fg(accent).add_modifier(Modifier::BOLD),
             _ => Style::default().fg(Color::Gray),
@@ -5713,7 +5723,7 @@ fn render_broadcast_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(" project: {} ", basename),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[0],
     );
@@ -5738,7 +5748,7 @@ fn render_broadcast_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Ctrl+U clears · empty input = no-op ",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[2],
     );
@@ -5783,7 +5793,7 @@ fn render_confirm_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Press Y to confirm · N to cancel ",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[1],
     );
@@ -5826,7 +5836,7 @@ fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(" {} tabs in current layout ", app.tabs.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[0],
     );
@@ -5851,7 +5861,7 @@ fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
     // Sanitised preview so users see what the on-disk name will look like.
     let preview = layout::sanitize_name(&app.save_as_input);
     let preview_line = if preview.is_empty() {
-        Span::styled(" (empty)", Style::default().fg(Color::DarkGray))
+        Span::styled(" (empty)", Style::default().fg(theme::theme().fg_dim))
     } else {
         Span::styled(
             format!(" → {}.json", preview),
@@ -5871,7 +5881,7 @@ fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
     } else {
         Line::from(Span::styled(
             " Ctrl+U clears · `/` `\\` `:` are stripped ",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))
     };
     f.render_widget(Paragraph::new(footer), chunks[3]);
@@ -5912,7 +5922,7 @@ fn render_rename_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             label,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[0],
     );
@@ -5938,7 +5948,7 @@ fn render_rename_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[2],
     );
@@ -6128,7 +6138,7 @@ fn render_search_overlay(f: &mut ratatui::Frame, pty_area: Rect, app: &mut App) 
         Span::styled("█", Style::default().fg(Color::Gray)),
         Span::raw(" "),
         Span::styled(counter, counter_style),
-        Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        Span::styled(hint, Style::default().fg(theme::theme().fg_dim)),
     ]);
     f.render_widget(
         Paragraph::new(header).style(Style::default().bg(theme::theme().bg_input)),
@@ -6186,7 +6196,7 @@ fn build_snippet(buf: &ScrollbackText, m: scrollback_text::Match, max_w: usize) 
     let post = &line[m_end..win_end];
 
     Line::from(vec![
-        Span::styled(prefix_marker, Style::default().fg(Color::DarkGray)),
+        Span::styled(prefix_marker, Style::default().fg(theme::theme().fg_dim)),
         Span::styled(pre.to_string(), Style::default().fg(Color::Gray)),
         Span::styled(
             hit.to_string(),
@@ -6196,7 +6206,7 @@ fn build_snippet(buf: &ScrollbackText, m: scrollback_text::Match, max_w: usize) 
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(post.to_string(), Style::default().fg(Color::Gray)),
-        Span::styled(suffix_marker, Style::default().fg(Color::DarkGray)),
+        Span::styled(suffix_marker, Style::default().fg(theme::theme().fg_dim)),
     ])
 }
 
@@ -6235,11 +6245,10 @@ fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
 
     f.render_widget(Clear, area);
 
-    let accent = app.accent_color();
     let block = Block::default()
-        .title(" Command palette  ·  Esc close ")
+        .title(" Command palette ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
+        .border_style(theme::focus_border(true))
         .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -6250,6 +6259,7 @@ fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
             Constraint::Length(1), // input
             Constraint::Length(1), // count
             Constraint::Min(1),    // list
+            Constraint::Length(1), // hint
         ])
         .split(inner);
 
@@ -6277,16 +6287,21 @@ fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             count,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[1],
     );
 
     // List
     let list_area = chunks[2];
+    let hint_area = chunks[3];
+    f.render_widget(
+        hint_line(" Enter run · ↑/↓ navigate · type to filter · Ctrl+U clear · Esc close "),
+        hint_area,
+    );
     if app.palette_filtered.is_empty() {
         f.render_widget(
-            Paragraph::new(" (no matches) ").style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(" (no matches) ").style(Style::default().fg(theme::theme().fg_dim)),
             list_area,
         );
         return;
@@ -6299,6 +6314,7 @@ fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
     }
 
     let max_w = list_area.width.saturating_sub(2) as usize;
+    let th = theme::theme();
     let mut lines: Vec<Line> = Vec::with_capacity(visible);
     for i in 0..visible {
         let f_idx = scroll + i;
@@ -6309,11 +6325,11 @@ fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         let selected = f_idx == app.palette_idx;
         let style = if selected {
             Style::default()
-                .bg(Color::Cyan)
+                .bg(th.accent)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(th.fg_strong)
         };
         let label = truncate(&it.label, max_w.saturating_sub(2));
         lines.push(Line::from(Span::styled(format!(" {} ", label), style)));
@@ -6459,7 +6475,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect, filter: &str) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 " (no shortcuts match) ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::theme().fg_dim),
             ))),
             inner,
         );
@@ -6596,7 +6612,7 @@ fn render_commands_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             count_text,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[1],
     );
@@ -6604,7 +6620,7 @@ fn render_commands_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let list_area = chunks[2];
     if app.commands_filtered.is_empty() {
         f.render_widget(
-            Paragraph::new(" (no matches) ").style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(" (no matches) ").style(Style::default().fg(theme::theme().fg_dim)),
             list_area,
         );
         return;
@@ -6638,7 +6654,7 @@ fn render_commands_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let desc_style = if selected {
             Style::default().bg(Color::Yellow).fg(Color::DarkGray)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme::theme().fg_dim)
         };
         let badge = entry.source.badge();
         let mut name_line: Vec<Span> = Vec::with_capacity(2);
@@ -6746,7 +6762,7 @@ fn render_files_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Enter open · Space → claude · → cd · ← parent · Ctrl+B close ",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         chunks[0],
     );
@@ -6858,7 +6874,7 @@ fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             count_text,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().fg_dim),
         ))),
         inner_chunks[1],
     );
@@ -6874,7 +6890,7 @@ fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             " (no matches) ".to_string()
         };
         f.render_widget(
-            Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(msg).style(Style::default().fg(theme::theme().fg_dim)),
             list_area,
         );
         return;
@@ -6913,7 +6929,7 @@ fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let meta_style = if selected {
             Style::default().bg(Color::White).fg(Color::DarkGray)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme::theme().fg_dim)
         };
         let snippet_style = if selected {
             Style::default().bg(Color::White).fg(Color::Rgb(60, 100, 60))
