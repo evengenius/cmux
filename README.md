@@ -222,19 +222,39 @@ bell = true    # терминальный BEL при переходе в Awaitin
 toast = true   # Windows toast (no-op на других ОС)
 
 [theme]
-# Accent — для рамок палитры/save-as модалов и т.п.
+# Accent — для рамок ВСЕХ модалов / сайдбаров (фокусированных) и т.п.
 # cyan | yellow | green | magenta | red | blue | white | gray | light*
 accent = "cyan"
+# Палитра: `dark` (по умолчанию), `light` (для светлых терминалов;
+# инвертирует фоны панелей/инпутов), `auto` (определяет по env COLORFGBG).
+mode = "dark"
+# Заменить эмодзи (📌, 🔍) на ASCII-аналоги ([*], ?) — для SSH-сессий
+# на bare ttys, LANG=C и шрифтов без emoji-поддержки.
+ascii_icons = false
 
 [keys]
-# Переназначение F-ключей и сочетаний на любые Action (nullary). Формат:
+# Переназначение клавиш на любые nullary Action. Формат:
 #   action_name = "key_combo"
-# Action: snake_case вариантов внутреннего Action enum.
 # Key: f1..f12, single chars, ctrl-x, alt-shift-f4 и т.п.
 # Дефолтные биндинги остаются — это только override / добавление.
 # Пример:
 #   toggle_search = "f4"     # F4 открывает поиск вместо F4=commands
 #   quit          = "ctrl-x" # Ctrl+X выходит дополнительно к F10/Ctrl+Q
+#
+# Список action_name (snake_case от внутренних Action):
+#   new_tab · close_tab · prev_tab · next_tab · rename_active_tab
+#   toggle_active_pin · toggle_sidebar · toggle_commands · toggle_help
+#   toggle_palette · toggle_browser · toggle_files_sidebar · toggle_search
+#   toggle_deep_grep · toggle_mouse · toggle_bottom · toggle_global_sessions
+#   prev_project · next_project · open_browser_for_new_project
+#   toggle_active_project_pin · new_tab_continue · open_broadcast
+#   show_active_usage · show_git_diff · clear_active_chat
+#   copy_chat_scrollback · copy_last_response · reopen_last_closed
+#   restore_layout · open_save_layout_as · export_session_note
+#   reload_config · quit
+# (Параметризованные действия — SwitchTab(i), SwitchProject(i),
+#  NewTabWithModel(i), InsertSnippet(i) — биндить нельзя, потому что
+#  индекс. Используйте Alt+1..9 / Ctrl+Shift+1..9 / палитру.)
 ```
 
 ## Layout (сохранение и восстановление)
@@ -284,8 +304,37 @@ accent = "cyan"
 - Основная платформа разработки — Windows. Под Linux/macOS код компилируется и должен работать, но я не тестирую там.
 - Нижний шелл при `follow_tab_cwd = true` отправляет `cd` через writer — если ты прямо в этот момент что-то печатаешь в шелле, можно перебить ввод. Поэтому follow срабатывает только когда нижняя панель не сфокусирована.
 - `session_id` для *новых* (не resumed) вкладок резолвится эвристически при сохранении: cwd вкладки сопоставляется со свежайшим `.jsonl` в `~/.claude/projects/`. Два одновременных таба в одной cwd могут разрешиться неверно.
-- Кастомные кейбинды через config — нет (F-ключи захардкожены).
 - Подсветка матча в PTY не пересекает line-wrap.
+
+## FAQ / Troubleshooting
+
+**`claude` не запускается / не найден**
+- Убедись, что `claude` (или `claude.cmd` на Windows) есть в `PATH`. Запусти `claude --version` из обычной оболочки — если там не работает, cmux тоже не запустит.
+- На Windows проверь, что путь к `npm`-биновому каталогу есть в `PATH` (там лежит `claude.cmd`, см. вывод `npm bin -g`).
+
+**TUI выглядит как мусор / квадратики вместо рамок**
+- Терминал не понимает UTF-8 или не имеет шрифта с поддержкой box-drawing. Поставь современный фонт (JetBrains Mono / Fira Code / Cascadia Code) и `LANG=en_US.UTF-8`. Если эмодзи (📌, 🔍) рендерятся плохо или ломают лейаут — поставь `[theme] ascii_icons = true`.
+
+**Светлый терминал — белое на белом**
+- Поставь `[theme] mode = "light"`. Включает палитру с тёмным текстом на светлых фонах модалов и сайдбаров.
+
+**Уведомления не приходят при AwaitingPermission**
+- Linux: `[notify] osc = true` — большинство Konsole/KDE-семейства подхватят. Других нативных вариантов нет (BEL может быть отключен в настройках терминала).
+- macOS: установи hammerspoon / iTerm2 → его настройки уведомлений на BEL. Без этого `bell = true` просто звякает.
+- Windows: `toast = true` использует PowerShell-WinRT — должно работать «из коробки». Если нет — проверь что PowerShell в `PATH`.
+- Webhook: `webhook = "https://..."` отправляет JSON через `curl`. Если `curl` не в `PATH` — no-op без жалоб.
+
+**Нижняя shell-панель не следует за активным табом**
+- Проверь `[shell] follow_tab_cwd = true` в конфиге. Follow срабатывает **только** когда панель не сфокусирована — иначе `cd` мог бы перебить твой ввод.
+
+**Worktree-режим не работает / fall-back на обычный cwd**
+- `[git] auto_worktree = true` требует, чтобы текущий каталог был внутри git-репозитория, а `git worktree add` отрабатывал без ошибок (часто ломается, когда `worktree_root` указывает за пределы репо или там уже есть конфликтующее имя ветки). Запусти `git worktree add .cmux-worktrees/test cmux/test` вручную чтобы локализовать причину.
+
+**Mouse-режим конфликтует с tmux / screen**
+- Нажми `F7` — переключает между mouse-on и mouse-off. В mouse-off ты можешь выделять текст для копирования через стандартный механизм терминала.
+
+**Палитра F9 слишком длинная**
+- В версиях ≥ 0.2 каждое действие имеет префикс категории — `[Tab]`, `[Claude]`, `[Project]`, `[View]`, `[Layout]`, `[App]`. Введи название категории чтобы показать только её действия.
 
 ## Лицензия
 
