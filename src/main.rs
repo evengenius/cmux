@@ -5633,7 +5633,6 @@ fn render_diff_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
 
     f.render_widget(Clear, area);
 
-    let accent = app.accent_color();
     let title = format!(
         "{}·  j/k scroll · g/G top/bottom · r refresh · Esc close ",
         app.diff_title
@@ -5641,7 +5640,7 @@ fn render_diff_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
+        .border_style(theme::focus_border(true))
         .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -5674,8 +5673,10 @@ fn render_diff_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
             {
                 Style::default().fg(theme::theme().fg_dim)
             }
-            Some('─') => Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            _ => Style::default().fg(Color::Gray),
+            Some('─') => Style::default()
+                .fg(theme::theme().accent)
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default().fg(theme::theme().fg),
         };
         lines.push(Line::from(Span::styled(trimmed, style)));
     }
@@ -5697,11 +5698,10 @@ fn render_usage_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
 
     f.render_widget(Clear, area);
 
-    let accent = app.accent_color();
     let block = Block::default()
-        .title(" Active chat usage  ·  any key to close ")
+        .title(" Active chat usage  ·  Esc / q close ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
+        .border_style(theme::focus_border(true))
         .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -7301,10 +7301,19 @@ fn handle_key(
         return handle_broadcast_key(k, app);
     }
 
-    // Usage modal — any key dismisses (read-only popup).
+    // Usage modal — read-only popup. Esc/q/Enter close, navigation
+    // keys would scroll if usage gets large enough (currently it fits
+    // on one screen, so scrolling is a no-op). Crucially, ordinary
+    // typed characters DON'T dismiss — they'd otherwise force the
+    // user to peek at usage and risk dismissing it mid-thought.
     if app.usage_open {
-        app.usage_open = false;
-        app.usage_lines.clear();
+        match k.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                app.usage_open = false;
+                app.usage_lines.clear();
+            }
+            _ => {}
+        }
         return Ok(KeyOutcome::LayoutChanged);
     }
 
