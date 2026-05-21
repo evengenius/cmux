@@ -1475,11 +1475,8 @@ impl App {
         }
     }
 
-    /// Accent colour resolved from config; cached lookups are cheap, no need
-    /// to memoise.
-    fn accent_color(&self) -> Color {
-        parse_accent(&self.config.theme.accent)
-    }
+    // `accent_color()` used to live here, but every call site has
+    // migrated to `theme::theme().accent` via the centralised palette.
 
     /// Call after any change that may have shifted the active tab.
     fn on_active_changed(&mut self) {
@@ -4531,12 +4528,14 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
 
                 // Bottom-bar right slot: alert wins over scroll/mouse tags
                 // so transient confirmations are seen. AlertKind drives
-                // colour: Info=green, Warn=yellow, Error=red.
+                // colour: Info=ok, Warn=warn, Error=error (all sourced
+                // from the active theme so light-mode contrast is right).
                 let info_tag: Option<(String, Style)> = if let Some((msg, _, kind)) = &app.alert {
+                    let th = theme::theme();
                     let style = match kind {
-                        AlertKind::Info => Style::default().bg(Color::Green).fg(Color::Black),
-                        AlertKind::Warn => Style::default().bg(Color::Yellow).fg(Color::Black),
-                        AlertKind::Error => Style::default().bg(Color::Red).fg(Color::White),
+                        AlertKind::Info => Style::default().bg(th.fg_ok).fg(Color::Black),
+                        AlertKind::Warn => Style::default().bg(th.fg_warn).fg(Color::Black),
+                        AlertKind::Error => Style::default().bg(th.fg_error).fg(Color::White),
                     }
                     .add_modifier(Modifier::BOLD);
                     Some((format!(" {} ", truncate(msg, 70)), style))
