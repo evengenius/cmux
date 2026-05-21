@@ -123,17 +123,18 @@ fn make(mode_str: &str, accent: Color) -> Theme {
     }
 }
 
-pub fn init(mode_str: &str, accent: Color) {
+pub fn init(mode_str: &str, accent: Color, ascii_icons: bool) {
     let t = make(mode_str, accent);
     if let Some(slot) = THEME.get() {
         *slot.lock().unwrap() = t;
     } else {
         let _ = THEME.set(Mutex::new(t));
     }
+    set_ascii_icons(ascii_icons);
 }
 
-pub fn reload(mode_str: &str, accent: Color) {
-    init(mode_str, accent);
+pub fn reload(mode_str: &str, accent: Color, ascii_icons: bool) {
+    init(mode_str, accent, ascii_icons);
 }
 
 pub fn theme() -> Theme {
@@ -152,4 +153,44 @@ pub fn focus_border(focused: bool) -> ratatui::style::Style {
     let t = theme();
     let c = if focused { t.accent } else { t.border_inactive };
     ratatui::style::Style::default().fg(c)
+}
+
+// =====================================================================
+// Icons — config-controlled fallback between emoji and ASCII so the
+// TUI stays readable on terminals without emoji-aware fonts (bare ttys,
+// SSH-into-old-server, LANG=C).
+// =====================================================================
+static ASCII_ICONS: std::sync::OnceLock<std::sync::Mutex<bool>> = std::sync::OnceLock::new();
+
+pub fn set_ascii_icons(on: bool) {
+    if let Some(slot) = ASCII_ICONS.get() {
+        *slot.lock().unwrap() = on;
+    } else {
+        let _ = ASCII_ICONS.set(std::sync::Mutex::new(on));
+    }
+}
+
+fn ascii_icons() -> bool {
+    ASCII_ICONS
+        .get()
+        .map(|s| *s.lock().unwrap())
+        .unwrap_or(false)
+}
+
+/// Pin marker — shown on pinned chats / projects.
+pub fn pin_icon() -> &'static str {
+    if ascii_icons() {
+        "[*] "
+    } else {
+        "📌 "
+    }
+}
+
+/// Search marker — shown on the scrollback-search counter pill.
+pub fn search_icon() -> &'static str {
+    if ascii_icons() {
+        "?"
+    } else {
+        "🔍"
+    }
 }

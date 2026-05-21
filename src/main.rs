@@ -913,7 +913,11 @@ enum AlertKind {
 impl App {
     fn new(cwd: PathBuf, rows: u16, cols: u16) -> Result<Self> {
         let config = config::load();
-        theme::init(&config.theme.mode, parse_accent(&config.theme.accent));
+        theme::init(
+            &config.theme.mode,
+            parse_accent(&config.theme.accent),
+            config.theme.ascii_icons,
+        );
         let scrollback = config.layout.scrollback_lines;
         let tab = ChatTab::spawn(cwd.clone(), rows, cols, scrollback)?;
         Ok(Self {
@@ -1464,6 +1468,7 @@ impl App {
         theme::reload(
             &self.config.theme.mode,
             parse_accent(&self.config.theme.accent),
+            self.config.theme.ascii_icons,
         );
         if let Some(b) = self.browser.as_mut() {
             b.set_show_hidden(self.config.browser.show_hidden);
@@ -4651,7 +4656,7 @@ fn render_project_bar(
             .and_then(|s| s.to_str())
             .unwrap_or_else(|| p.to_str().unwrap_or(""))
             .to_string();
-        let pin_prefix = if pinned.contains(p) { "📌 " } else { "" };
+        let pin_prefix = if pinned.contains(p) { theme::pin_icon() } else { "" };
         let label = format!(" {}{}: {} ", pin_prefix, i + 1, truncate(&name, 20));
         let w = label.chars().count() as u16;
         if x.saturating_add(w) > limit {
@@ -4734,11 +4739,16 @@ fn render_chat_bar(
             ),
             TabState::AwaitingPermission => (
                 Some(" ! "),
+                // Static red pill — was BOLD|SLOW_BLINK, but many
+                // terminals strip BLINK (or have it disabled by a11y
+                // settings) which silently killed the most important
+                // visual signal in the whole TUI. White-on-red bold
+                // pill is unmistakeable and respects every renderer.
                 Some(
                     Style::default()
-                        .fg(Color::Red)
-                        .bg(Color::Black)
-                        .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+                        .fg(Color::White)
+                        .bg(theme::theme().fg_error)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ),
         };
@@ -4753,7 +4763,7 @@ fn render_chat_bar(
             Some(format!(" [{}] ", unread))
         };
 
-        let pin_prefix = if t.pinned { "📌 " } else { "" };
+        let pin_prefix = if t.pinned { theme::pin_icon() } else { "" };
         // Per-project chat number (display_pos + 1), not global tab index.
         let label = format!(" {}{}: {} ", pin_prefix, display_pos + 1, t.title);
         let label_w = label.chars().count() as u16;
@@ -6162,7 +6172,7 @@ fn render_search_overlay(f: &mut ratatui::Frame, pty_area: Rect, app: &mut App) 
 
     let header = Line::from(vec![
         Span::styled(
-            " 🔍 ",
+            format!(" {} ", theme::search_icon()),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
