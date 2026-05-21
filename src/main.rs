@@ -275,6 +275,10 @@ enum PendingConfirm {
     UnpinAndCloseChat(usize),
     /// Close every chat whose cwd equals this path.
     CloseProject(PathBuf),
+    /// Send a captured broadcast prompt to every chat in the active
+    /// project. Captured at confirm time so the modal can close cleanly
+    /// before the (potentially slow) per-PTY write loop runs.
+    BroadcastSend(String),
 }
 
 #[derive(Default)]
@@ -1966,16 +1970,17 @@ impl App {
         self.usage_open = true;
     }
 
-    /// Send `self.broadcast.input` (with a trailing `\r` so claude submits it)
-    /// to every chat sharing the active project's cwd. Errors per chat are
+    /// Send `text` (with a trailing `\r` so claude submits it) to every
+    /// chat sharing the active project's cwd. Errors per chat are
     /// swallowed — one stuck PTY shouldn't abort the whole broadcast.
-    fn apply_broadcast(&mut self) -> usize {
-        let text = self.broadcast.input.trim().to_string();
-        if text.is_empty() {
+    /// Returns the count of chats successfully written to.
+    fn apply_broadcast(&mut self, text: &str) -> usize {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
             return 0;
         }
         let cwd = self.active_project_cwd();
-        let mut payload = text.into_bytes();
+        let mut payload = trimmed.as_bytes().to_vec();
         payload.push(b'\r');
         let mut sent = 0;
         for t in self.tabs.iter_mut() {
@@ -2033,6 +2038,17 @@ impl App {
             PendingConfirm::CloseProject(cwd) => {
                 self.close_project(&cwd);
                 self.on_active_changed();
+            }
+            PendingConfirm::BroadcastSend(text) => {
+                let sent = self.apply_broadcast(&text);
+                if sent > 0 {
+                    self.set_alert(
+                        AlertKind::Info,
+                        format!("✓ broadcast sent to {} chat(s)", sent),
+                    );
+                } else {
+                    self.set_alert(AlertKind::Warn, "broadcast: 0 chats matched");
+                }
             }
         }
         self.confirm.clear();
@@ -4915,7 +4931,29 @@ fn handle_broadcast_key(k: crossterm::event::KeyEvent, app: &mut App) -> Result<
             return Ok(KeyOutcome::LayoutChanged);
         }
         KeyCode::Enter => {
-            let sent = app.apply_broadcast();
+            let text = app.broadcast.input.trim().to_string();
+            if text.is_empty() {
+                app.broadcast.clear();
+                return Ok(KeyOutcome::LayoutChanged);
+            }
+            let cwd = app.active_project_cwd();
+            let target_count = app.tabs.iter().filter(|t| t.cwd == cwd).count();
+            // For ≥2 chats this is destructive: a typo will hit every
+            // chat in the project. Route through the confirm modal —
+            // skipped when there's only one chat (broadcast == /clear-
+            // equivalent, no fan-out risk).
+            if target_count >= 2 {
+                app.broadcast.clear();
+                app.ask_confirm(
+                    format!(
+                        "Send broadcast to {} chat(s)?  Y / Enter — send · N / Esc — cancel",
+                        target_count
+                    ),
+                    PendingConfirm::BroadcastSend(text),
+                );
+                return Ok(KeyOutcome::LayoutChanged);
+            }
+            let sent = app.apply_broadcast(&text);
             app.broadcast.clear();
             if sent > 0 {
                 app.set_alert(
