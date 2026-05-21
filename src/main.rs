@@ -2305,65 +2305,103 @@ impl App {
 
     fn rebuild_palette_items(&mut self) {
         let mut items: Vec<PaletteItem> = Vec::new();
-        let push_action = |items: &mut Vec<PaletteItem>, label: &str, action: Action| {
+        // Category prefix → action item. The bracketed `[Cat]` tag is
+        // visible AND part of the search haystack, so typing "tab" or
+        // "view" filters by category. The `★` glyph is preserved at
+        // the head so the visual cue from earlier versions stays.
+        let push_action = |items: &mut Vec<PaletteItem>, cat: &str, label: &str, action: Action| {
+            let full = format!("[{}]  ★  {}", cat, label);
             items.push(PaletteItem {
-                label: label.to_string(),
-                hay: label.to_lowercase(),
+                label: full.clone(),
+                hay: full.to_lowercase(),
                 kind: PaletteKind::Action(action),
             });
         };
-        push_action(&mut items, "★  New tab", Action::NewTab);
+
+        // -- Tab category --
+        push_action(&mut items, "Tab", "New tab", Action::NewTab);
         push_action(
             &mut items,
-            "★  New tab continuing last session (claude --continue)",
+            "Tab",
+            "New tab continuing last session (claude --continue)",
             Action::NewTabContinue,
         );
         for (i, model) in NEW_TAB_MODELS.iter().enumerate() {
-            let label = format!("★  New tab with model: {}", model);
-            items.push(PaletteItem {
-                label: label.clone(),
-                hay: label.to_lowercase(),
-                kind: PaletteKind::Action(Action::NewTabWithModel(i)),
-            });
+            push_action(
+                &mut items,
+                "Tab",
+                &format!("New tab with model: {}", model),
+                Action::NewTabWithModel(i),
+            );
         }
+        push_action(&mut items, "Tab", "Close active tab", Action::CloseTab);
+        push_action(&mut items, "Tab", "Previous chat (in project)", Action::PrevTab);
+        push_action(&mut items, "Tab", "Next chat (in project)", Action::NextTab);
         push_action(
             &mut items,
-            "★  Broadcast prompt to all chats in active project…",
+            "Tab",
+            "Rename active tab (Shift+F2)",
+            Action::RenameActiveTab,
+        );
+        let pin_label = if self
+            .tabs
+            .get(self.active)
+            .map(|t| t.pinned)
+            .unwrap_or(false)
+        {
+            "Unpin active tab"
+        } else {
+            "Pin active tab (drag to reorder)"
+        };
+        push_action(&mut items, "Tab", pin_label, Action::ToggleActivePin);
+        push_action(
+            &mut items,
+            "Tab",
+            "Reopen most recently closed chat (Ctrl+Shift+T)",
+            Action::ReopenLastClosed,
+        );
+
+        // -- Claude category --
+        push_action(
+            &mut items,
+            "Claude",
+            "Broadcast prompt to all chats in active project…",
             Action::OpenBroadcast,
         );
         push_action(
             &mut items,
-            "★  Show usage / token totals for active chat",
+            "Claude",
+            "Show usage / token totals for active chat",
             Action::ShowActiveUsage,
         );
         push_action(
             &mut items,
-            "★  Show git diff for active chat's cwd",
+            "Claude",
+            "Show git diff for active chat's cwd",
             Action::ShowGitDiff,
         );
         push_action(
             &mut items,
-            "★  Clear active chat (sends /clear · Ctrl+L)",
+            "Claude",
+            "Clear active chat (sends /clear · Ctrl+L)",
             Action::ClearActiveChat,
         );
         push_action(
             &mut items,
-            "★  Copy active chat's scrollback to clipboard",
+            "Claude",
+            "Copy active chat's scrollback to clipboard",
             Action::CopyChatScrollback,
         );
         push_action(
             &mut items,
-            "★  Copy last claude response to clipboard",
+            "Claude",
+            "Copy last claude response to clipboard",
             Action::CopyLastResponse,
         );
         push_action(
             &mut items,
-            "★  Reopen most recently closed chat (Ctrl+Shift+T)",
-            Action::ReopenLastClosed,
-        );
-        push_action(
-            &mut items,
-            "★  Export session note (Markdown → <cwd>/sessions/)",
+            "Claude",
+            "Export session note (Markdown → <cwd>/sessions/)",
             Action::ExportSessionNote,
         );
         // Refresh the snippet-name snapshot every palette rebuild so
@@ -2373,104 +2411,142 @@ impl App {
         for (i, name) in self.snippet_keys.iter().enumerate() {
             let text = self.config.snippets.get(name).cloned().unwrap_or_default();
             let preview = text.chars().take(40).collect::<String>();
-            let label = format!("★  Insert snippet: {} — {}", name, preview);
+            let label = format!("[Claude]  ★  Insert snippet: {} — {}", name, preview);
             items.push(PaletteItem {
                 label: label.clone(),
-                hay: format!("snippet {} {}", name.to_lowercase(), text.to_lowercase()),
+                hay: format!("claude snippet {} {}", name.to_lowercase(), text.to_lowercase()),
                 kind: PaletteKind::Action(Action::InsertSnippet(i)),
             });
         }
-        push_action(&mut items, "★  Close active tab", Action::CloseTab);
-        push_action(&mut items, "★  Previous chat (in project)", Action::PrevTab);
-        push_action(&mut items, "★  Next chat (in project)", Action::NextTab);
-        push_action(&mut items, "★  Previous project (Ctrl+F11)", Action::PrevProject);
-        push_action(&mut items, "★  Next project (Ctrl+F12)", Action::NextProject);
+
+        // -- Project category --
         push_action(
             &mut items,
-            "★  New project — pick a directory in the file browser",
+            "Project",
+            "Previous project (Ctrl+F11)",
+            Action::PrevProject,
+        );
+        push_action(
+            &mut items,
+            "Project",
+            "Next project (Ctrl+F12)",
+            Action::NextProject,
+        );
+        push_action(
+            &mut items,
+            "Project",
+            "New project — pick a directory in the file browser",
             Action::OpenBrowserForNewProject,
         );
         let project_pin_label = if self.is_project_pinned(&self.active_project_cwd()) {
-            "★  Unpin active project"
+            "Unpin active project"
         } else {
-            "★  Pin active project"
+            "Pin active project"
         };
-        push_action(&mut items, project_pin_label, Action::ToggleActiveProjectPin);
-        push_action(&mut items, "★  Toggle sessions sidebar", Action::ToggleSidebar);
         push_action(
             &mut items,
-            "★  Global sessions (Shift+F3, grouped by dir)",
+            "Project",
+            project_pin_label,
+            Action::ToggleActiveProjectPin,
+        );
+        push_action(
+            &mut items,
+            "Project",
+            "Global sessions (Shift+F3, grouped by dir)",
             Action::ToggleGlobalSessions,
         );
-        push_action(&mut items, "★  Toggle commands sidebar", Action::ToggleCommands);
-        push_action(&mut items, "★  Toggle files sidebar", Action::ToggleFilesSidebar);
-        push_action(&mut items, "★  Show help overlay", Action::ToggleHelp);
-        push_action(&mut items, "★  Toggle deep-grep", Action::ToggleDeepGrep);
-        push_action(&mut items, "★  Open file browser (modal)", Action::ToggleBrowser);
-        push_action(&mut items, "★  Toggle bottom terminal", Action::ToggleBottom);
-        push_action(&mut items, "★  Search scrollback (Ctrl+F)", Action::ToggleSearch);
-        push_action(&mut items, "★  Rename active tab (Shift+F2)", Action::RenameActiveTab);
-        let pin_label = if self
-            .tabs
-            .get(self.active)
-            .map(|t| t.pinned)
-            .unwrap_or(false)
-        {
-            "★  Unpin active tab"
-        } else {
-            "★  Pin active tab (drag to reorder)"
-        };
-        push_action(&mut items, pin_label, Action::ToggleActivePin);
-        push_action(&mut items, "★  Toggle mouse mode", Action::ToggleMouse);
-        let cfg_path = config::config_path();
-        let cfg_label = format!("★  Reload config ({})", cfg_path.display());
-        items.push(PaletteItem {
-            label: cfg_label.clone(),
-            hay: cfg_label.to_lowercase(),
-            kind: PaletteKind::Action(Action::ReloadConfig),
-        });
+
+        // -- View category --
+        push_action(
+            &mut items,
+            "View",
+            "Toggle sessions sidebar",
+            Action::ToggleSidebar,
+        );
+        push_action(
+            &mut items,
+            "View",
+            "Toggle commands sidebar",
+            Action::ToggleCommands,
+        );
+        push_action(
+            &mut items,
+            "View",
+            "Toggle files sidebar",
+            Action::ToggleFilesSidebar,
+        );
+        push_action(&mut items, "View", "Show help overlay", Action::ToggleHelp);
+        push_action(&mut items, "View", "Toggle deep-grep", Action::ToggleDeepGrep);
+        push_action(
+            &mut items,
+            "View",
+            "Open file browser (modal)",
+            Action::ToggleBrowser,
+        );
+        push_action(
+            &mut items,
+            "View",
+            "Toggle bottom terminal",
+            Action::ToggleBottom,
+        );
+        push_action(
+            &mut items,
+            "View",
+            "Search scrollback (Ctrl+F)",
+            Action::ToggleSearch,
+        );
+        push_action(&mut items, "View", "Toggle mouse mode", Action::ToggleMouse);
+
+        // -- Layout category --
         if let Some(saved) = &self.saved_layout {
             let label = format!(
-                "★  Restore previous layout ({} tabs from {})",
+                "Restore previous layout ({} tabs from {})",
                 saved.tabs.len(),
                 relative_unix(saved.saved_at_unix)
             );
-            items.push(PaletteItem {
-                label: label.clone(),
-                hay: label.to_lowercase(),
-                kind: PaletteKind::Action(Action::RestoreLayout),
-            });
+            push_action(&mut items, "Layout", &label, Action::RestoreLayout);
         }
-        // Named layouts — save-as plus per-layout switch / delete.
         push_action(
             &mut items,
-            "★  Save current layout as…",
+            "Layout",
+            "Save current layout as…",
             Action::OpenSaveLayoutAs,
         );
         for (i, name) in self.layout_names.iter().enumerate() {
-            let label = format!("⇄  Switch to layout: {}", name);
+            let full = format!("[Layout]  ⇄  Switch to layout: {}", name);
             items.push(PaletteItem {
-                label: label.clone(),
-                hay: format!("switch layout {}", name.to_lowercase()),
+                label: full,
+                hay: format!("layout switch {}", name.to_lowercase()),
                 kind: PaletteKind::LayoutSwitch(i),
             });
         }
         for (i, name) in self.layout_names.iter().enumerate() {
-            let label = format!("✕  Delete saved layout: {}", name);
+            let full = format!("[Layout]  ✕  Delete saved layout: {}", name);
             items.push(PaletteItem {
-                label: label.clone(),
-                hay: format!("delete layout {}", name.to_lowercase()),
+                label: full,
+                hay: format!("layout delete {}", name.to_lowercase()),
                 kind: PaletteKind::LayoutDelete(i),
             });
         }
-        push_action(&mut items, "★  Quit", Action::Quit);
 
+        // -- App category --
+        let cfg_path = config::config_path();
+        push_action(
+            &mut items,
+            "App",
+            &format!("Reload config ({})", cfg_path.display()),
+            Action::ReloadConfig,
+        );
+        push_action(&mut items, "App", "Quit", Action::Quit);
+
+        // -- Session resume entries (kept ungrouped — they're data,
+        //    not commands; user matches by chat title / cwd / branch).
         for (i, s) in self.sessions.iter().enumerate() {
             let cwd = sessions::cwd_label(&s.cwd);
             let branch = s.git_branch.as_deref().unwrap_or("");
             let label = format!("⤴  {}  ·  {}  ·  {}", s.title, cwd, branch);
             let hay = format!(
-                "{}\n{}\n{}\n{}",
+                "session\n{}\n{}\n{}\n{}",
                 s.title.to_lowercase(),
                 cwd.to_lowercase(),
                 branch.to_lowercase(),
