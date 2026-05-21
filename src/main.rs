@@ -4304,7 +4304,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 app.project_rects = proj_rects;
                 app.new_project_rect = new_proj_rect;
                 f.render_widget(
-                    Paragraph::new(proj_line).style(Style::default().bg(Color::Black)),
+                    Paragraph::new(proj_line).style(Style::default().bg(theme::bg_root())),
                     chunks[0],
                 );
 
@@ -4320,7 +4320,7 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 app.chat_rects = chat_rects;
                 app.new_tab_rect = Some(new_rect);
                 f.render_widget(
-                    Paragraph::new(chat_line).style(Style::default().bg(Color::Black)),
+                    Paragraph::new(chat_line).style(Style::default().bg(theme::bg_root())),
                     chunks[1],
                 );
 
@@ -4726,7 +4726,9 @@ fn render_project_bar(
     let prefix = " projects: ";
     spans.push(Span::styled(
         prefix,
-        Style::default().bg(Color::Black).fg(Color::DarkGray),
+        Style::default()
+            .bg(theme::bg_root())
+            .fg(theme::theme().fg_dim),
     ));
     x = x.saturating_add(prefix.chars().count() as u16);
 
@@ -4748,7 +4750,7 @@ fn render_project_bar(
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(theme::theme().bg_chrome).fg(Color::Gray)
+            Style::default().bg(theme::theme().bg_chrome).fg(theme::theme().fg)
         };
         spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
@@ -4863,9 +4865,15 @@ fn render_chat_bar(
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(Color::DarkGray).fg(Color::Gray)
+            Style::default()
+                .bg(theme::theme().bg_inactive)
+                .fg(theme::theme().fg)
         };
-        let label_bg = if is_active { Color::White } else { Color::DarkGray };
+        let label_bg = if is_active {
+            theme::theme().fg_strong
+        } else {
+            theme::theme().bg_inactive
+        };
 
         spans.push(Span::styled(label, label_style));
         if let Some(b) = badge {
@@ -5539,7 +5547,7 @@ fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
             }
             BrowserEntry::Parent => Style::default().fg(Color::Yellow),
             BrowserEntry::Dir(_) => Style::default().fg(Color::Cyan),
-            BrowserEntry::File(_) => Style::default().fg(Color::White),
+            BrowserEntry::File(_) => Style::default().fg(theme::theme().fg_strong),
             BrowserEntry::Drive(_) => {
                 Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
             }
@@ -5612,8 +5620,8 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
     };
     let input = Line::from(vec![
         Span::styled(" / ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(q_display, Style::default().fg(Color::White)),
-        Span::styled("█", Style::default().fg(Color::Gray)),
+        Span::styled(q_display, Style::default().fg(theme::theme().fg_strong)),
+        Span::styled("█", Style::default().fg(theme::theme().fg)),
     ]);
     f.render_widget(
         Paragraph::new(input).style(Style::default().bg(theme::theme().bg_input)),
@@ -5699,7 +5707,7 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
                         .fg(Color::Black)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(theme::theme().fg_strong)
                 };
                 lines.push(Line::from(Span::styled(row, style)));
             }
@@ -5800,7 +5808,7 @@ fn render_usage_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         .usage_lines
         .iter()
         .map(|l| {
-            Line::from(Span::styled(l.clone(), Style::default().fg(Color::White)))
+            Line::from(Span::styled(l.clone(), Style::default().fg(theme::theme().fg_strong)))
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
@@ -5865,8 +5873,8 @@ fn render_broadcast_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
     };
     let input = Line::from(vec![
         Span::styled(" ▶ ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        Span::styled(display, Style::default().fg(Color::White)),
-        Span::styled("█", Style::default().fg(Color::Gray)),
+        Span::styled(display, Style::default().fg(theme::theme().fg_strong)),
+        Span::styled("█", Style::default().fg(theme::theme().fg)),
     ]);
     f.render_widget(
         Paragraph::new(input).style(Style::default().bg(theme::theme().bg_input)),
@@ -5914,7 +5922,7 @@ fn render_confirm_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(" {} ", msg),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::theme().fg_strong).add_modifier(Modifier::BOLD),
         ))),
         chunks[0],
     );
@@ -5977,8 +5985,8 @@ fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
     };
     let input = Line::from(vec![
         Span::styled(" ▶ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(q_display, Style::default().fg(Color::White)),
-        Span::styled("█", Style::default().fg(Color::Gray)),
+        Span::styled(q_display, Style::default().fg(theme::theme().fg_strong)),
+        Span::styled("█", Style::default().fg(theme::theme().fg)),
     ]);
     f.render_widget(
         Paragraph::new(input).style(Style::default().bg(theme::theme().bg_input)),
@@ -6068,8 +6076,8 @@ fn render_rename_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
     };
     let input = Line::from(vec![
         Span::styled(" ▶ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(q_display, Style::default().fg(Color::White)),
-        Span::styled("█", Style::default().fg(Color::Gray)),
+        Span::styled(q_display, Style::default().fg(theme::theme().fg_strong)),
+        Span::styled("█", Style::default().fg(theme::theme().fg)),
     ]);
     f.render_widget(
         Paragraph::new(input).style(Style::default().bg(theme::theme().bg_input)),
@@ -6266,8 +6274,8 @@ fn render_search_overlay(f: &mut ratatui::Frame, pty_area: Rect, app: &mut App) 
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(q_display, Style::default().fg(Color::White)),
-        Span::styled("█", Style::default().fg(Color::Gray)),
+        Span::styled(q_display, Style::default().fg(theme::theme().fg_strong)),
+        Span::styled("█", Style::default().fg(theme::theme().fg)),
         Span::raw(" "),
         Span::styled(counter, counter_style),
         Span::styled(hint, Style::default().fg(theme::theme().fg_dim)),
@@ -6329,7 +6337,7 @@ fn build_snippet(buf: &ScrollbackText, m: scrollback_text::Match, max_w: usize) 
 
     Line::from(vec![
         Span::styled(prefix_marker, Style::default().fg(theme::theme().fg_dim)),
-        Span::styled(pre.to_string(), Style::default().fg(Color::Gray)),
+        Span::styled(pre.to_string(), Style::default().fg(theme::theme().fg)),
         Span::styled(
             hit.to_string(),
             Style::default()
@@ -6337,7 +6345,7 @@ fn build_snippet(buf: &ScrollbackText, m: scrollback_text::Match, max_w: usize) 
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(post.to_string(), Style::default().fg(Color::Gray)),
+        Span::styled(post.to_string(), Style::default().fg(theme::theme().fg)),
         Span::styled(suffix_marker, Style::default().fg(theme::theme().fg_dim)),
     ])
 }
@@ -6398,8 +6406,8 @@ fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
     // Input
     let input = Line::from(vec![
         Span::styled(" ▶ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(app.palette_query.clone(), Style::default().fg(Color::White)),
-        Span::styled("█", Style::default().fg(Color::Gray)),
+        Span::styled(app.palette_query.clone(), Style::default().fg(theme::theme().fg_strong)),
+        Span::styled("█", Style::default().fg(theme::theme().fg)),
     ]);
     f.render_widget(
         Paragraph::new(input).style(Style::default().bg(theme::theme().bg_input)),
@@ -6531,8 +6539,8 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect, filter: &str) {
             " / ",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(filter.to_string(), Style::default().fg(Color::White)),
-        Span::styled("█", Style::default().fg(Color::Gray)),
+        Span::styled(filter.to_string(), Style::default().fg(theme::theme().fg_strong)),
+        Span::styled("█", Style::default().fg(theme::theme().fg)),
     ]);
     f.render_widget(
         Paragraph::new(filter_line).style(Style::default().bg(theme::theme().bg_input)),
@@ -6599,7 +6607,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect, filter: &str) {
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("   "),
-                Span::styled(*v, Style::default().fg(Color::White)),
+                Span::styled(*v, Style::default().fg(theme::theme().fg_strong)),
             ])
         })
         .collect();
@@ -6728,8 +6736,8 @@ fn render_commands_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             " / ",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(app.filter.clone(), Style::default().fg(Color::White)),
-        Span::styled("█", Style::default().fg(Color::Gray)),
+        Span::styled(app.filter.clone(), Style::default().fg(theme::theme().fg_strong)),
+        Span::styled("█", Style::default().fg(theme::theme().fg)),
     ]);
     f.render_widget(
         Paragraph::new(search_line).style(Style::default().bg(theme::theme().bg_input)),
@@ -6929,7 +6937,7 @@ fn render_files_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
             BrowserEntry::Parent => Style::default().fg(Color::Yellow),
             BrowserEntry::Dir(_) => Style::default().fg(Color::Cyan),
-            BrowserEntry::File(_) => Style::default().fg(Color::White),
+            BrowserEntry::File(_) => Style::default().fg(theme::theme().fg_strong),
             BrowserEntry::Drive(_) => Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
@@ -6970,8 +6978,8 @@ fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     // Search bar
     let mut search_spans = vec![
         Span::styled(" / ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(app.filter.clone(), Style::default().fg(Color::White)),
-        Span::styled("█", Style::default().fg(Color::Gray)),
+        Span::styled(app.filter.clone(), Style::default().fg(theme::theme().fg_strong)),
+        Span::styled("█", Style::default().fg(theme::theme().fg)),
     ];
     if app.deep_grep {
         search_spans.push(Span::raw("  "));
@@ -7056,7 +7064,7 @@ fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme::theme().fg_strong)
         };
         let meta_style = if selected {
             Style::default().bg(Color::White).fg(Color::DarkGray)

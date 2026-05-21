@@ -144,6 +144,17 @@ pub fn theme() -> Theme {
     Theme::dark(Color::Cyan)
 }
 
+/// Root background under the project / chat bars. On dark mode this
+/// is solid black (the historic look); on light mode it falls back to
+/// the chrome background so text written in `fg_dim` stays readable.
+pub fn bg_root() -> Color {
+    let t = theme();
+    match t.mode {
+        Mode::Dark => Color::Black,
+        Mode::Light => t.bg_chrome,
+    }
+}
+
 /// Border style for focusable panels. Focus = accent (warm, visible);
 /// unfocused = `border_inactive` (dim grey on dark, mid-grey on light).
 /// Use this for every sidebar / modal so the focus signal is the same
