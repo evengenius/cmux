@@ -5862,11 +5862,10 @@ fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
 
     f.render_widget(Clear, area);
 
-    let accent = app.accent_color();
     let block = Block::default()
         .title(" Save layout as  ·  Enter save · Esc cancel ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
+        .border_style(theme::focus_border(true))
         .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -5922,9 +5921,14 @@ fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
     );
 
     let footer = if let Some(err) = &app.save_as_error {
+        // High-contrast error strip — easy to miss the previous
+        // plain-red text on the same panel background.
         Line::from(Span::styled(
-            format!(" ! {}", err),
-            Style::default().fg(Color::Red),
+            format!(" ! {} ", err),
+            Style::default()
+                .fg(Color::White)
+                .bg(theme::theme().fg_error)
+                .add_modifier(Modifier::BOLD),
         ))
     } else {
         Line::from(Span::styled(
