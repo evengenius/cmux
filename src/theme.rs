@@ -142,3 +142,14 @@ pub fn theme() -> Theme {
     }
     Theme::dark(Color::Cyan)
 }
+
+/// Border style for focusable panels. Focus = accent (warm, visible);
+/// unfocused = `border_inactive` (dim grey on dark, mid-grey on light).
+/// Use this for every sidebar / modal so the focus signal is the same
+/// across the whole TUI — siblings differentiate via title text, not
+/// per-panel colour.
+pub fn focus_border(focused: bool) -> ratatui::style::Style {
+    let t = theme();
+    let c = if focused { t.accent } else { t.border_inactive };
+    ratatui::style::Style::default().fg(c)
+}

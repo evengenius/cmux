@@ -5349,7 +5349,7 @@ fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
+        .border_style(theme::focus_border(true))
         .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -5451,7 +5451,7 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(theme::focus_border(true))
         .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -5694,7 +5694,7 @@ fn render_broadcast_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
             target_count
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
+        .border_style(theme::focus_border(true))
         .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -5895,7 +5895,7 @@ fn render_rename_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
     let block = Block::default()
         .title(" Rename tab  ·  Enter apply · Esc cancel ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(theme::focus_border(true))
         .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -6368,7 +6368,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect, filter: &str) {
     let block = Block::default()
         .title(" Help  ·  type to filter · Ctrl+U clear · Esc / F1 close ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(theme::focus_border(true))
         .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -6558,11 +6558,10 @@ fn render_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 fn render_commands_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let focused = app.sidebar_focused;
     let focus_tag = if focused { " ● " } else { " ○ " };
-    let border_color = if focused { Color::Yellow } else { Color::DarkGray };
     let block = Block::default()
         .title(format!(" Claude commands{} ", focus_tag))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(theme::focus_border(focused));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -6732,11 +6731,10 @@ fn render_files_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
     let focus_tag = if focused { " ● " } else { " ○ " };
     let title = format!(" Files{}{} ", focus_tag, truncate(&browser::path_label(&br.cwd), 70));
-    let border_color = if focused { Color::Magenta } else { Color::DarkGray };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(theme::focus_border(focused));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -6803,17 +6801,12 @@ fn render_files_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
 fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let focus_tag = if app.sidebar_focused { " ● " } else { " ○ " };
-    let border_color = if app.sidebar_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
     let scope = app.scope_root();
     let scope_label = truncate(&sessions::cwd_label(&scope), 28);
     let block = Block::default()
         .title(format!(" Sessions{}↪ {} ", focus_tag, scope_label))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(theme::focus_border(app.sidebar_focused));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
