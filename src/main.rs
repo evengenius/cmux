@@ -4332,7 +4332,11 @@ fn run<B: ratatui::backend::Backend + std::io::Write>(
                 // Reserve the rightmost column for a vertical scrollbar — the
                 // PTY itself renders to (width - 1) and is resized
                 // accordingly via the `last_pty_area` propagation below.
-                let scrollbar_w: u16 = if inner_area.width > 4 { 1 } else { 0 };
+                // Skip on very narrow widths (no room) and on very short
+                // heights (the begin/end glyphs would take the whole bar
+                // and the thumb wouldn't have a track to ride on).
+                let scrollbar_w: u16 =
+                    if inner_area.width > 4 && inner_area.height >= 4 { 1 } else { 0 };
                 let pty_area = Rect {
                     x: inner_area.x,
                     y: inner_area.y,
