@@ -8,6 +8,7 @@ mod notify;
 mod scrollback_text;
 mod sessions;
 mod shell;
+mod theme;
 mod worktree;
 
 use commands::{CommandEntry, CommandSource};
@@ -908,6 +909,7 @@ enum AlertKind {
 impl App {
     fn new(cwd: PathBuf, rows: u16, cols: u16) -> Result<Self> {
         let config = config::load();
+        theme::init(&config.theme.mode, parse_accent(&config.theme.accent));
         let scrollback = config.layout.scrollback_lines;
         let tab = ChatTab::spawn(cwd.clone(), rows, cols, scrollback)?;
         Ok(Self {
@@ -1455,6 +1457,10 @@ impl App {
     fn reload_config(&mut self) {
         self.config = config::load();
         self.key_bindings = KeyBindings::from_config(&self.config.keys);
+        theme::reload(
+            &self.config.theme.mode,
+            parse_accent(&self.config.theme.accent),
+        );
         if let Some(b) = self.browser.as_mut() {
             b.set_show_hidden(self.config.browser.show_hidden);
         }
@@ -4631,7 +4637,7 @@ fn render_project_bar(
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(Color::Rgb(40, 40, 50)).fg(Color::Gray)
+            Style::default().bg(theme::theme().bg_chrome).fg(Color::Gray)
         };
         spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
@@ -4654,7 +4660,7 @@ fn render_project_bar(
         spans.push(Span::styled(
             plus_label,
             Style::default()
-                .bg(Color::Rgb(40, 40, 50))
+                .bg(theme::theme().bg_chrome)
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ));
@@ -5344,7 +5350,7 @@ fn render_browser(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta))
-        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+        .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -5446,7 +5452,7 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+        .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -5472,7 +5478,7 @@ fn render_global_sessions(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
         Span::styled("█", Style::default().fg(Color::Gray)),
     ]);
     f.render_widget(
-        Paragraph::new(input).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        Paragraph::new(input).style(Style::default().bg(theme::theme().bg_input)),
         chunks[0],
     );
 
@@ -5588,7 +5594,7 @@ fn render_diff_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(Color::Rgb(18, 20, 22)));
+        .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -5648,7 +5654,7 @@ fn render_usage_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         .title(" Active chat usage  ·  any key to close ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+        .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -5689,7 +5695,7 @@ fn render_broadcast_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta))
-        .style(Style::default().bg(Color::Rgb(20, 18, 28)));
+        .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -5725,7 +5731,7 @@ fn render_broadcast_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App
         Span::styled("█", Style::default().fg(Color::Gray)),
     ]);
     f.render_widget(
-        Paragraph::new(input).style(Style::default().bg(Color::Rgb(28, 28, 36))),
+        Paragraph::new(input).style(Style::default().bg(theme::theme().bg_input)),
         chunks[1],
     );
 
@@ -5757,7 +5763,7 @@ fn render_confirm_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
         .title(" Confirm  ·  Y / Enter — yes · N / Esc — no ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red))
-        .style(Style::default().bg(Color::Rgb(30, 20, 20)));
+        .style(Style::default().bg(theme::theme().bg_danger));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -5803,7 +5809,7 @@ fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
         .title(" Save layout as  ·  Enter save · Esc cancel ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+        .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -5838,7 +5844,7 @@ fn render_save_as_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) 
         Span::styled("█", Style::default().fg(Color::Gray)),
     ]);
     f.render_widget(
-        Paragraph::new(input).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        Paragraph::new(input).style(Style::default().bg(theme::theme().bg_input)),
         chunks[1],
     );
 
@@ -5890,7 +5896,7 @@ fn render_rename_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         .title(" Rename tab  ·  Enter apply · Esc cancel ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+        .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -5924,7 +5930,7 @@ fn render_rename_modal(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         Span::styled("█", Style::default().fg(Color::Gray)),
     ]);
     f.render_widget(
-        Paragraph::new(input).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        Paragraph::new(input).style(Style::default().bg(theme::theme().bg_input)),
         chunks[1],
     );
 
@@ -6125,7 +6131,7 @@ fn render_search_overlay(f: &mut ratatui::Frame, pty_area: Rect, app: &mut App) 
         Span::styled(hint, Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(
-        Paragraph::new(header).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        Paragraph::new(header).style(Style::default().bg(theme::theme().bg_input)),
         chunks[0],
     );
 
@@ -6144,7 +6150,7 @@ fn render_search_overlay(f: &mut ratatui::Frame, pty_area: Rect, app: &mut App) 
         _ => Line::raw(""),
     };
     f.render_widget(
-        Paragraph::new(snippet_line).style(Style::default().bg(Color::Rgb(20, 20, 24))),
+        Paragraph::new(snippet_line).style(Style::default().bg(theme::theme().bg_panel)),
         chunks[1],
     );
 }
@@ -6234,7 +6240,7 @@ fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         .title(" Command palette  ·  Esc close ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+        .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -6254,7 +6260,7 @@ fn render_palette(f: &mut ratatui::Frame, full_area: Rect, app: &mut App) {
         Span::styled("█", Style::default().fg(Color::Gray)),
     ]);
     f.render_widget(
-        Paragraph::new(input).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        Paragraph::new(input).style(Style::default().bg(theme::theme().bg_input)),
         chunks[0],
     );
 
@@ -6363,7 +6369,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect, filter: &str) {
         .title(" Help  ·  type to filter · Ctrl+U clear · Esc / F1 close ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(20, 20, 24)));
+        .style(Style::default().bg(theme::theme().bg_panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -6381,7 +6387,7 @@ fn render_help(f: &mut ratatui::Frame, full_area: Rect, filter: &str) {
         Span::styled("█", Style::default().fg(Color::Gray)),
     ]);
     f.render_widget(
-        Paragraph::new(filter_line).style(Style::default().bg(Color::Rgb(28, 28, 32))),
+        Paragraph::new(filter_line).style(Style::default().bg(theme::theme().bg_input)),
         chunks[0],
     );
     let inner = chunks[1];
@@ -6506,7 +6512,7 @@ fn render_button_bar(
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(Color::Rgb(80, 80, 80)).fg(Color::White)
+            Style::default().bg(theme::theme().bg_button).fg(Color::White)
         };
         spans.push(Span::styled(label, style));
         // 1-cell gap (DarkGray bg, like the bar)
@@ -6579,7 +6585,7 @@ fn render_commands_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Span::styled("█", Style::default().fg(Color::Gray)),
     ]);
     f.render_widget(
-        Paragraph::new(search_line).style(Style::default().bg(Color::Rgb(28, 28, 28))),
+        Paragraph::new(search_line).style(Style::default().bg(theme::theme().bg_input)),
         chunks[0],
     );
 
@@ -6835,7 +6841,7 @@ fn render_sessions_sidebar(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     }
     f.render_widget(
         Paragraph::new(Line::from(search_spans))
-            .style(Style::default().bg(Color::Rgb(28, 28, 28))),
+            .style(Style::default().bg(theme::theme().bg_input)),
         inner_chunks[0],
     );
 

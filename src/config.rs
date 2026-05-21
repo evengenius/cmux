@@ -75,16 +75,33 @@ pub struct ThemeConfig {
     /// lightyellow, lightcyan. Unknown values fall back to cyan.
     #[serde(default = "default_accent")]
     pub accent: String,
+    /// Palette mode: `dark` (default), `light`, or `auto` — `auto`
+    /// inspects `COLORFGBG` to guess the host terminal's background.
+    /// Light mode swaps every chrome / panel / input background so the
+    /// TUI is readable against a white-on-light terminal.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// When true, icons that rely on emoji (`📌`, `🔍`) fall back to
+    /// ASCII alternatives (`[*]`, `?`). Useful for terminals without
+    /// emoji-aware fonts, SSH sessions on bare ttys, or LANG=C.
+    #[serde(default)]
+    pub ascii_icons: bool,
 }
 
 fn default_accent() -> String {
     "cyan".to_string()
 }
 
+fn default_mode() -> String {
+    "dark".to_string()
+}
+
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
             accent: default_accent(),
+            mode: default_mode(),
+            ascii_icons: false,
         }
     }
 }
@@ -320,6 +337,15 @@ webhook = ""
 # green, magenta, red, blue, white, gray, lightblue, lightgreen,
 # lightmagenta, lightred, lightyellow, lightcyan.
 accent = "cyan"
+# Palette mode. `dark` is the historic default; `light` swaps every
+# panel / input / chrome background so the TUI stays readable on
+# terminals with a white-on-light theme; `auto` guesses from the
+# COLORFGBG env var (set by xterm, rxvt, urxvt, some emulators).
+mode = "dark"
+# When true, replace emoji icons (📌, 🔍) with ASCII fallbacks ([*], ?).
+# Switch this on for SSH sessions on bare ttys or LANG=C environments
+# where emoji either render as tofu or as wide glyphs that smear layout.
+ascii_icons = false
 
 [git]
 # When true, F2 / F6-OpenHere spawn the new chat into a fresh git worktree
