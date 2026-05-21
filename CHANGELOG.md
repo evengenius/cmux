@@ -6,6 +6,51 @@ git log into reader-friendly chunks.
 
 ## [Unreleased]
 
+### UX / UI polish (review pass)
+
+- **Width-aware `truncate`.** Project / chat / session labels now budget
+  by terminal *display columns* instead of `chars().count()`. CJK,
+  emoji, and other wide glyphs no longer push siblings off-screen.
+- **Unified focus / modal border colour.** Sidebars (Sessions / Files /
+  Commands) and modals (Browse, Help, Palette, Save-as, Rename,
+  Broadcast, Diff, Usage, Global sessions) all route through
+  `theme::focus_border(focused)`. Focused = configured accent;
+  unfocused = `border_inactive`. Siblings differentiate via title text
+  only.
+- **Light-mode + auto-detect theme.** New `[theme] mode = "dark" |
+  "light" | "auto"`. `auto` inspects `COLORFGBG` (xterm / rxvt). Every
+  ratatui call site reads from a centralised `Theme` struct, so all
+  panel / input / chrome / button / hint / body colours follow.
+- **ASCII-icon fallback.** New `[theme] ascii_icons = true` swaps `📌`
+  for `[*]` and `🔍` for `?` — for SSH-into-old-server, LANG=C, fonts
+  without emoji.
+- **AwaitingPermission badge no longer blinks.** Switched to a static
+  white-on-red bold pill so terminals that strip `BLINK` (gnome-
+  terminal, kitty, alacritty, vscode-terminal) and a11y setups still
+  surface the most important signal in the TUI.
+- **Unified hint-bar in every modal.** New `hint_line()` helper plus a
+  fresh hint row in the F9 palette (`Enter run · ↑/↓ navigate · type
+  to filter · Ctrl+U clear · Esc close`).
+- **Grouped command palette.** Every action carries a category prefix
+  — `[Tab]`, `[Claude]`, `[Project]`, `[View]`, `[Layout]`, `[App]` —
+  visible AND in the search haystack. Type "view" to filter by
+  category.
+- **Confirm before broadcasting to ≥2 chats.** Enter in the broadcast
+  modal now pops a Y/N confirmation when the project has more than one
+  chat; single-chat case is unchanged.
+- **Usage modal stops dismissing on any keypress.** Only Esc / Enter /
+  q close it; typing into the modal no longer leaks to the underlying
+  PTY.
+- **Save-as error strip.** Validation failures show as a high-contrast
+  white-on-red bold strip instead of plain red text on the panel.
+- **Scrollbar hidden on short PTYs.** Below 4 rows the ▲ / ▼ caps
+  consumed the whole bar; PTY now reclaims the column.
+- **README FAQ + action_names reference.** New troubleshooting section
+  covering `claude` not on PATH, box-drawing on legacy fonts, light
+  terminal contrast, OS notification setup per platform, shell
+  follow_tab_cwd, worktree fallback, tmux/mouse conflict. The `[keys]`
+  example now enumerates every bindable action name.
+
 ### Added
 
 - **Project / chat two-row top bar.** Row 0 shows unique cwds among open
