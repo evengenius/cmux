@@ -82,6 +82,7 @@ dependencies = [
  "sysinfo",
  "toml",
  "tui-term",
+ "unicode-width 0.2.0",
  "vt100",
 ]
 

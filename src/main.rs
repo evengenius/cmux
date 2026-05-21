@@ -2876,13 +2876,35 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+/// Display-width of a string in terminal columns. Wide chars (CJK, emoji)
+/// count as 2; control chars and zero-width joiners count as 0. Falls back
+/// to char-count if a glyph has no width entry.
+fn display_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    UnicodeWidthStr::width(s)
+}
+
+/// Truncate `s` so its display width fits within `max` terminal columns.
+/// Appends `…` (width 1) as an overflow indicator when truncation occurs —
+/// note: the indicator is in addition to `max`, matching the original
+/// char-counting behaviour so existing layout budgets stay correct.
 fn truncate(s: &str, max: usize) -> String {
-    let collected: String = s.chars().take(max).collect();
-    if s.chars().count() > max {
-        format!("{}…", collected)
-    } else {
-        collected
+    use unicode_width::UnicodeWidthChar;
+    if display_width(s) <= max {
+        return s.to_string();
     }
+    let mut out = String::with_capacity(s.len());
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        w += cw;
+        out.push(ch);
+    }
+    out.push('…');
+    out
 }
 
 // ===========================================================================
